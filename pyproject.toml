@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydromancer-eda"
+version = "0.1.0"
+description = "Hyperliquid orderflow ingestion + wallet flow labeling with Hydromancer API and TimescaleDB"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "asyncpg>=0.29.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.3.4",
+  "python-dotenv>=1.0.1",
+  "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+  "mypy>=1.11.0",
+  "pytest>=8.3.0",
+  "pytest-asyncio>=0.23.8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hydromancer_eda = ["sql/*.sql"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

@@ -1,0 +1,1 @@
+"""Packaged database schema resources."""
