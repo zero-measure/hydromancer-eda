@@ -1,3 +1,5 @@
+"""Run the ingestion service with graceful SIGINT and SIGTERM shutdown."""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +11,7 @@ from hydromancer_eda.ingestion.allfills import AllFillsIngestionService
 
 
 async def _main() -> None:
+    """Configure signal handling and run the allFills ingestion service."""
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

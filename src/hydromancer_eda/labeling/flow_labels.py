@@ -1,3 +1,5 @@
+"""Compute rolling wallet-flow labels from persisted order-flow events."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -9,10 +11,35 @@ from hydromancer_eda.models import WalletLabelSnapshot
 
 
 class FlowLabeler:
+    """Compute behavioral and performance features for observed wallets."""
+
     def __init__(self, settings: Settings) -> None:
+        """Initialize the labeler with aggregation and markout settings.
+
+        Args:
+            settings (Settings): Label window and markout horizon configuration.
+
+        """
         self._settings = settings
 
     async def compute_snapshots(self, pool: asyncpg.Pool, as_of: datetime) -> list[WalletLabelSnapshot]:
+        """Compute rolling wallet metrics as of a timestamp.
+
+        The query uses ``label_agg_window_hours`` for the observation window and
+        ``label_markout_horizon_seconds`` for post-trade price selection.
+
+        Args:
+            pool (asyncpg.Pool): Connected PostgreSQL pool containing events.
+            as_of (datetime): Timezone-aware upper bound and snapshot timestamp.
+
+        Returns:
+            list[WalletLabelSnapshot]: One validated snapshot per observed wallet.
+
+        Raises:
+            asyncpg.PostgresError: If the analytics query fails.
+            pydantic.ValidationError: If a query row cannot form a snapshot.
+
+        """
         query = """
         WITH recent AS (
             SELECT *

@@ -1,3 +1,5 @@
+"""Canonical models for normalized order flow and wallet label snapshots."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -13,7 +15,16 @@ MarginMode = Literal["cross", "isolated", "unknown"]
 
 
 def _first_present(payload: dict[str, Any], *keys: str) -> Any:
-    """Return the first present non-null value, retaining valid falsy values."""
+    """Return the first present, non-null payload value.
+
+    Args:
+        payload (dict[str, Any]): Mapping to inspect.
+        *keys (str): Candidate keys in descending priority order.
+
+    Returns:
+        Any: First non-null value, including valid falsy values, or ``None``.
+
+    """
     for key in keys:
         value = payload.get(key)
         if value is not None:
@@ -22,6 +33,13 @@ def _first_present(payload: dict[str, Any], *keys: str) -> Any:
 
 
 class OrderflowEvent(BaseModel):
+    """Represent one normalized participant-level allFills event.
+
+    Unknown side, aggressor, and margin values normalize to ``"unknown"``.
+    The ``raw`` field retains the ingestion payload, including its canonical
+    envelope wallet address.
+    """
+
     ts: datetime
     symbol: str
     wallet: str
@@ -47,6 +65,19 @@ class OrderflowEvent(BaseModel):
 
     @staticmethod
     def timestamp_from_hydromancer(payload: dict[str, Any]) -> datetime:
+        """Parse a Hydromancer timestamp as a timezone-aware datetime.
+
+        Args:
+            payload (dict[str, Any]): Fill payload containing ``time``, ``ts``,
+                or ``timestamp`` as epoch milliseconds or an ISO-8601 string.
+
+        Returns:
+            datetime: Parsed timestamp; naive strings are interpreted as UTC.
+
+        Raises:
+            ValueError: If no supported timestamp value is present or parseable.
+
+        """
         ts_value = _first_present(payload, "time", "ts", "timestamp")
         if isinstance(ts_value, (int, float)) and not isinstance(ts_value, bool):
             return datetime.fromtimestamp(ts_value / 1000, tz=UTC)
@@ -57,7 +88,22 @@ class OrderflowEvent(BaseModel):
 
     @classmethod
     def from_hydromancer(cls, payload: dict[str, Any]) -> OrderflowEvent:
-        """Normalize a Hydromancer fill while retaining unknown enum values as data."""
+        """Normalize a Hydromancer fill into an order-flow event.
+
+        Args:
+            payload (dict[str, Any]): Fill payload augmented with the canonical
+                allFills envelope address.
+
+        Returns:
+            OrderflowEvent: Validated participant-level event.
+
+        Raises:
+            KeyError: If the required ``txIndex`` field is absent.
+            TypeError: If a required numeric value has an unsupported type.
+            ValueError: If required identity fields or numeric values are invalid.
+            ArithmeticError: If derived notional arithmetic fails.
+
+        """
         ts = cls.timestamp_from_hydromancer(payload)
         price = _first_present(payload, "px", "price")
         size = _first_present(payload, "sz", "size")
@@ -121,6 +167,14 @@ class OrderflowEvent(BaseModel):
 
 
 class WalletLabelSnapshot(BaseModel):
+    """Represent wallet-flow metrics computed for one aggregation timestamp.
+
+    Optional fields cover taker markout, realized performance, liquidation and
+    message activity, holding time, liquidity provision, notional preferences,
+    leverage, and margin-mode usage. A value is ``None`` when source events are
+    insufficient to calculate the metric.
+    """
+
     bucket_ts: datetime
     wallet: str
 

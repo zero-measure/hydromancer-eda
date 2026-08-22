@@ -1,0 +1,1 @@
+"""Hydromancer protocol client adapters."""

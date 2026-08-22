@@ -1,3 +1,5 @@
+"""Application settings for Hydromancer ingestion and wallet labeling."""
+
 from functools import lru_cache
 
 from pydantic import Field, field_validator
@@ -21,21 +23,56 @@ class Settings(BaseSettings):
     @field_validator("hydromancer_coins")
     @classmethod
     def nonempty_coins(cls, value: str) -> str:
+        """Validate that a comma-separated coin setting contains a coin.
+
+        Args:
+            value (str): Raw comma-separated coin identifiers.
+
+        Returns:
+            str: The unchanged setting value.
+
+        Raises:
+            ValueError: If the value contains no non-whitespace coin identifiers.
+
+        """
         if not any(coin.strip() for coin in value.split(",")):
             raise ValueError("HYDROMANCER_COINS must contain at least one coin")
         return value
 
     @property
     def coins(self) -> list[str]:
+        """Return configured case-sensitive protocol coin identifiers.
+
+        Returns:
+            list[str]: Trimmed, nonempty coin identifiers in configured order.
+
+        """
         # Coin names are protocol identifiers and deliberately case-sensitive.
         return [coin.strip() for coin in self.hydromancer_coins.split(",") if coin.strip()]
 
     @property
     def symbols(self) -> list[str]:
-        """Backward-compatible name; unlike the old REST path it preserves case."""
+        """Return case-preserving coins under the legacy symbols name.
+
+        Unlike the retired REST path, this compatibility property does not
+        normalize protocol identifier casing.
+
+        Returns:
+            list[str]: Case-preserving protocol coin identifiers.
+
+        """
         return self.coins
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Load and cache the process-wide application settings.
+
+    Returns:
+        Settings: Validated settings loaded from environment variables and ``.env``.
+
+    Raises:
+        pydantic.ValidationError: If required settings are missing or invalid.
+
+    """
     return Settings()  # type: ignore[call-arg]
