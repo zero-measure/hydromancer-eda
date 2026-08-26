@@ -187,5 +187,6 @@ class WalletLabelSnapshot(BaseModel):
     holding_time_sec_median: float | None = None
     liquidity_provision_score: float | None = None
     round_number_notional_ratio: float | None = None
+    round_number_size_ratio: float | None = None
     max_leverage: float | None = None
     cross_margin_ratio: float | None = None

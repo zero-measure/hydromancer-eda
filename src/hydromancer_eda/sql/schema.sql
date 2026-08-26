@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS wallet_flow_labels (
     holding_time_sec_median DOUBLE PRECISION,
     liquidity_provision_score DOUBLE PRECISION,
     round_number_notional_ratio DOUBLE PRECISION,
+    round_number_size_ratio DOUBLE PRECISION,
     max_leverage DOUBLE PRECISION,
     cross_margin_ratio DOUBLE PRECISION,
 
@@ -89,6 +90,10 @@ CREATE TABLE IF NOT EXISTS wallet_flow_labels (
 
     PRIMARY KEY (bucket_ts, wallet)
 );
+
+-- Migration for databases created before token-size roundness was introduced.
+ALTER TABLE wallet_flow_labels
+ADD COLUMN IF NOT EXISTS round_number_size_ratio DOUBLE PRECISION;
 
 SELECT create_hypertable('wallet_flow_labels', by_range('bucket_ts'), if_not_exists => TRUE, migrate_data => TRUE);
 CREATE INDEX IF NOT EXISTS wallet_flow_labels_wallet_ts_idx ON wallet_flow_labels (wallet, bucket_ts DESC);

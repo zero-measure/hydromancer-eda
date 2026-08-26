@@ -236,12 +236,12 @@ class PostgresStore:
             liquidation_count, taker_ratio, cancel_to_fill_ratio,
             message_cadence_per_min, holding_time_sec_median,
             liquidity_provision_score, round_number_notional_ratio,
-            max_leverage, cross_margin_ratio, updated_at
+            round_number_size_ratio, max_leverage, cross_margin_ratio, updated_at
         ) VALUES (
             $1, $2, $3, $4,
             $5, $6, $7,
             $8, $9, $10,
-            $11, $12, $13, NOW()
+            $11, $12, $13, $14, NOW()
         )
         ON CONFLICT (bucket_ts, wallet) DO UPDATE SET
             taker_markout = EXCLUDED.taker_markout,
@@ -253,6 +253,7 @@ class PostgresStore:
             holding_time_sec_median = EXCLUDED.holding_time_sec_median,
             liquidity_provision_score = EXCLUDED.liquidity_provision_score,
             round_number_notional_ratio = EXCLUDED.round_number_notional_ratio,
+            round_number_size_ratio = EXCLUDED.round_number_size_ratio,
             max_leverage = EXCLUDED.max_leverage,
             cross_margin_ratio = EXCLUDED.cross_margin_ratio,
             updated_at = NOW()
@@ -271,6 +272,7 @@ class PostgresStore:
                 s.holding_time_sec_median,
                 s.liquidity_provision_score,
                 s.round_number_notional_ratio,
+                s.round_number_size_ratio,
                 s.max_leverage,
                 s.cross_margin_ratio,
             )

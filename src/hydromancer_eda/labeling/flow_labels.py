@@ -26,7 +26,11 @@ class FlowLabeler:
         """Compute rolling wallet metrics as of a timestamp.
 
         The query uses ``label_agg_window_hours`` for the observation window and
-        ``label_markout_horizon_seconds`` for post-trade price selection.
+        ``label_markout_horizon_seconds`` for post-trade price selection. A
+        notional is considered round when it is exactly divisible by at least
+        one of $10, $100, $1,000, or $10,000. Token size is considered round
+        when it is an exact multiple of 0.1 tokens, which includes whole-token
+        sizes.
 
         Args:
             pool (asyncpg.Pool): Connected PostgreSQL pool containing events.
@@ -41,7 +45,14 @@ class FlowLabeler:
 
         """
         query = """
-        WITH recent AS (
+        WITH round_notional_moduli(modulus) AS (
+            VALUES
+                (10::numeric),
+                (100::numeric),
+                (1000::numeric),
+                (10000::numeric)
+        ),
+        recent AS (
             SELECT *
             FROM orderflow_events
             WHERE ts >= $1::timestamptz - make_interval(hours => $2::int)
@@ -56,7 +67,18 @@ class FlowLabeler:
                 (COUNT(*) FILTER (WHERE event_type = 'cancel'))::float8 / NULLIF(COUNT(*) FILTER (WHERE event_type = 'fill'), 0) AS cancel_to_fill_ratio,
                 (COUNT(*))::float8 / GREATEST(($2::float8 * 60.0), 1.0) AS message_cadence_per_min,
                 (SUM(COALESCE(notional,0)) FILTER (WHERE aggressor='maker'))::float8 / NULLIF((SUM(COALESCE(notional,0)) FILTER (WHERE aggressor IN ('maker','taker'))), 0)::float8 AS liquidity_provision_score,
-                (COUNT(*) FILTER (WHERE ABS(COALESCE(notional,0) - ROUND(COALESCE(notional,0) / 1000.0) * 1000.0) <= 5.0))::float8 / NULLIF(COUNT(*) FILTER (WHERE notional IS NOT NULL), 0) AS round_number_notional_ratio,
+                (COUNT(*) FILTER (
+                    WHERE notional IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM round_notional_moduli r
+                          WHERE MOD(ABS(notional), r.modulus) = 0
+                      )
+                ))::float8 / NULLIF(COUNT(*) FILTER (WHERE notional IS NOT NULL), 0) AS round_number_notional_ratio,
+                (COUNT(*) FILTER (
+                    WHERE size IS NOT NULL
+                      AND MOD(ABS(size), 0.1::numeric) = 0
+                ))::float8 / NULLIF(COUNT(*) FILTER (WHERE size IS NOT NULL), 0) AS round_number_size_ratio,
                 MAX(leverage)::float8 AS max_leverage,
                 (COUNT(*) FILTER (WHERE margin_mode = 'cross'))::float8 / NULLIF(COUNT(*) FILTER (WHERE leverage IS NOT NULL), 0) AS cross_margin_ratio
             FROM recent
@@ -113,6 +135,7 @@ class FlowLabeler:
             h.holding_time_sec_median,
             b.liquidity_provision_score,
             b.round_number_notional_ratio,
+            b.round_number_size_ratio,
             b.max_leverage,
             b.cross_margin_ratio
         FROM base b
