@@ -112,18 +112,69 @@ GROUP BY symbol
 ORDER BY symbol;
 
 \echo ''
-\echo '=== Latest wallet labels ==='
+\echo '=== Wallet activity and latest labels over the last 24 hours ==='
+WITH activity_24h AS (
+    SELECT
+        wallet,
+        COUNT(*) AS event_count_24h,
+        COUNT(*) FILTER (
+            WHERE aggressor = 'taker'
+              AND event_type IN ('trade', 'fill')
+        ) AS taker_event_count_24h,
+        COUNT(*) FILTER (WHERE liquidation) AS liquidation_count_24h,
+        (COUNT(*) FILTER (WHERE liquidation))::float8
+            / NULLIF(COUNT(*), 0) AS liquidation_frequency_24h,
+        MIN(ts) AS first_event_24h,
+        MAX(ts) AS latest_event_24h
+    FROM orderflow_events
+    WHERE ts >= NOW() - INTERVAL '24 hours'
+    GROUP BY wallet
+),
+selected_wallets AS (
+    (SELECT wallet, 'most liquidations'::text AS selection
+     FROM activity_24h
+     ORDER BY liquidation_count_24h DESC, event_count_24h DESC
+     LIMIT 10)
+    UNION
+    (SELECT wallet, 'most taker activity'::text AS selection
+     FROM activity_24h
+     ORDER BY taker_event_count_24h DESC, event_count_24h DESC
+     LIMIT 10)
+)
 SELECT
-    bucket_ts,
-    wallet,
-    realized_pnl,
-    liquidation_count,
-    taker_ratio,
-    message_cadence_per_min,
-    liquidity_provision_score
-FROM wallet_flow_labels
-ORDER BY bucket_ts DESC
-LIMIT 20;
+    selected.selection,
+    labels.bucket_ts,
+    activity.wallet,
+    activity.event_count_24h,
+    activity.taker_event_count_24h,
+    activity.liquidation_count_24h,
+    activity.liquidation_frequency_24h,
+    activity.first_event_24h,
+    activity.latest_event_24h,
+    labels.taker_markout,
+    labels.realized_pnl,
+    labels.taker_ratio,
+    labels.cancel_to_fill_ratio,
+    labels.message_cadence_per_min,
+    labels.holding_time_sec_median,
+    labels.liquidity_provision_score,
+    labels.round_number_notional_ratio,
+    labels.round_number_size_ratio,
+    labels.max_leverage,
+    labels.cross_margin_ratio
+FROM selected_wallets selected
+JOIN activity_24h activity USING (wallet)
+JOIN LATERAL (
+    SELECT latest.*
+    FROM wallet_flow_labels latest
+    WHERE latest.wallet = activity.wallet
+    ORDER BY latest.bucket_ts DESC
+    LIMIT 1
+) labels ON TRUE
+ORDER BY
+    selected.selection,
+    activity.liquidation_count_24h DESC,
+    activity.taker_event_count_24h DESC;
 
 \echo ''
 \echo '=== TimescaleDB hypertables ==='
@@ -141,4 +192,4 @@ SELECT
     (SELECT MAX(ts) FROM orderflow_events) AS latest_event,
     (SELECT COUNT(*) FROM ingestion_rejects) AS rejects,
     (SELECT MAX(updated_at) FROM ingestion_checkpoints) AS latest_checkpoint,
-    (SELECT COUNT(*) FROM wallet_flow_labels) AS labels;
+    (SELECT MAX(bucket_ts) FROM wallet_flow_labels) AS latest_label_snapshot;
