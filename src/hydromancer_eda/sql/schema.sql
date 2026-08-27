@@ -69,9 +69,34 @@ CREATE INDEX IF NOT EXISTS orderflow_events_wallet_ts_idx ON orderflow_events (w
 CREATE INDEX IF NOT EXISTS orderflow_events_symbol_ts_idx ON orderflow_events (symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS orderflow_events_type_ts_idx ON orderflow_events (event_type, ts DESC);
 
+-- Labels are derived state, not event history. Replace any historical table
+-- whose primary key is not exactly (wallet). CASCADE also removes dependencies
+-- on the obsolete snapshot history. The next hourly pass repopulates the table.
+DO $$
+DECLARE
+    labels_table REGCLASS := to_regclass('wallet_flow_labels');
+BEGIN
+    IF labels_table IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM pg_constraint
+           WHERE conrelid = labels_table
+             AND contype = 'p'
+             AND conkey = ARRAY[
+                 (SELECT attnum
+                  FROM pg_attribute
+                  WHERE attrelid = labels_table
+                    AND attname = 'wallet')
+             ]::smallint[]
+       )
+    THEN
+        DROP TABLE wallet_flow_labels CASCADE;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS wallet_flow_labels (
+    wallet TEXT PRIMARY KEY,
     bucket_ts TIMESTAMPTZ NOT NULL,
-    wallet TEXT NOT NULL,
 
     taker_markout DOUBLE PRECISION,
     realized_pnl DOUBLE PRECISION,
@@ -86,14 +111,5 @@ CREATE TABLE IF NOT EXISTS wallet_flow_labels (
     max_leverage DOUBLE PRECISION,
     cross_margin_ratio DOUBLE PRECISION,
 
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    PRIMARY KEY (bucket_ts, wallet)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- Migration for databases created before token-size roundness was introduced.
-ALTER TABLE wallet_flow_labels
-ADD COLUMN IF NOT EXISTS round_number_size_ratio DOUBLE PRECISION;
-
-SELECT create_hypertable('wallet_flow_labels', by_range('bucket_ts'), if_not_exists => TRUE, migrate_data => TRUE);
-CREATE INDEX IF NOT EXISTS wallet_flow_labels_wallet_ts_idx ON wallet_flow_labels (wallet, bucket_ts DESC);

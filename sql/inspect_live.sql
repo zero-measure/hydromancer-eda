@@ -117,6 +117,7 @@ WITH activity_24h AS (
     SELECT
         wallet,
         COUNT(*) AS event_count_24h,
+        SUM(ABS(COALESCE(notional, 0))) AS notional_volume_24h,
         COUNT(*) FILTER (
             WHERE aggressor = 'taker'
               AND event_type IN ('trade', 'fill')
@@ -146,6 +147,7 @@ SELECT
     labels.bucket_ts,
     activity.wallet,
     activity.event_count_24h,
+    activity.notional_volume_24h,
     activity.taker_event_count_24h,
     activity.liquidation_count_24h,
     activity.liquidation_frequency_24h,
@@ -164,13 +166,7 @@ SELECT
     labels.cross_margin_ratio
 FROM selected_wallets selected
 JOIN activity_24h activity USING (wallet)
-JOIN LATERAL (
-    SELECT latest.*
-    FROM wallet_flow_labels latest
-    WHERE latest.wallet = activity.wallet
-    ORDER BY latest.bucket_ts DESC
-    LIMIT 1
-) labels ON TRUE
+LEFT JOIN wallet_flow_labels labels USING (wallet)
 ORDER BY
     selected.selection,
     activity.liquidation_count_24h DESC,

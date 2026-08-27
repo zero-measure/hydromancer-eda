@@ -26,8 +26,9 @@ class FlowLabeler:
         """Compute rolling wallet metrics as of a timestamp.
 
         The query uses ``label_agg_window_hours`` for the observation window and
-        ``label_markout_horizon_seconds`` for post-trade price selection. A
-        notional is considered round when it is exactly divisible by at least
+        ``label_markout_horizon_seconds`` for post-trade price selection. Wallets
+        below ``label_min_notional_24h`` in gross absolute notional are excluded.
+        A notional is considered round when it is exactly divisible by at least
         one of $10, $100, $1,000, or $10,000. Token size is considered round
         when it is an exact multiple of 0.1 tokens, which includes whole-token
         sizes.
@@ -58,6 +59,12 @@ class FlowLabeler:
             WHERE ts >= $1::timestamptz - make_interval(hours => $2::int)
               AND ts <= $1::timestamptz
         ),
+        qualified AS (
+            SELECT wallet
+            FROM recent
+            GROUP BY wallet
+            HAVING SUM(ABS(COALESCE(notional, 0))) >= $4::numeric
+        ),
         base AS (
             SELECT
                 wallet,
@@ -82,6 +89,7 @@ class FlowLabeler:
                 MAX(leverage)::float8 AS max_leverage,
                 (COUNT(*) FILTER (WHERE margin_mode = 'cross'))::float8 / NULLIF(COUNT(*) FILTER (WHERE leverage IS NOT NULL), 0) AS cross_margin_ratio
             FROM recent
+            JOIN qualified USING (wallet)
             GROUP BY wallet
         ),
         taker_markout AS (
@@ -95,6 +103,7 @@ class FlowLabeler:
                     END
                 )::float8 AS taker_markout
             FROM recent t
+            JOIN qualified q ON q.wallet = t.wallet
             JOIN LATERAL (
                 SELECT n.price
                 FROM orderflow_events n
@@ -114,6 +123,7 @@ class FlowLabeler:
                 o.wallet,
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (c.ts - o.ts)))::float8 AS holding_time_sec_median
             FROM recent o
+            JOIN qualified q ON q.wallet = o.wallet
             JOIN recent c
               ON o.wallet = c.wallet
              AND o.position_id IS NOT NULL
@@ -150,6 +160,7 @@ class FlowLabeler:
                 as_of,
                 self._settings.label_agg_window_hours,
                 self._settings.label_markout_horizon_seconds,
+                self._settings.label_min_notional_24h,
             )
 
         return [WalletLabelSnapshot.model_validate(dict(r)) for r in rows]

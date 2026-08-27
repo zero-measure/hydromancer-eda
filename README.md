@@ -106,7 +106,7 @@ At startup, the application reads `src/hydromancer_eda/sql/schema.sql` from the 
 - `orderflow_events` for normalized participant-level fills
 - `ingestion_checkpoints` for the durable session and opaque cursor
 - `ingestion_rejects` for malformed upstream entries
-- `wallet_flow_labels` for computed wallet metrics
+- `wallet_flow_labels` for one current metric row per qualifying wallet
 
 Inspect row counts from the Docker database:
 
@@ -115,6 +115,19 @@ docker exec hydromancer-timescaledb \
   psql --username postgres --dbname hydromancer \
   --command='SELECT COUNT(*) FROM orderflow_events;'
 ```
+
+Wallet labels are recomputed hourly over a rolling 24-hour window. Wallets with
+less than `$10,000` in gross absolute notional during that window are omitted,
+and wallets that fall below the threshold are removed from `wallet_flow_labels`.
+Only one current label row is retained per qualifying wallet. Configure these
+controls with `LABEL_AGG_WINDOW_HOURS`, `LABEL_MIN_NOTIONAL_24H`, and
+`LABEL_INTERVAL_SECONDS`. The minimum is applied over the configured aggregation
+window, so keep `LABEL_AGG_WINDOW_HOURS=24` for the named 24-hour threshold.
+
+On the first startup after upgrading from historical label snapshots, schema
+initialization drops the old derived `wallet_flow_labels` hypertable. The first
+label pass repopulates the new current-state table; raw
+`orderflow_events` and ingestion checkpoints are not removed.
 
 `HYDROMANCER_BUILDER_ADDRESS` is not used or required.
 

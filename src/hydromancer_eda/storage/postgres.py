@@ -212,21 +212,23 @@ class PostgresStore:
         return len(rows)
 
     async def upsert_label_snapshots(self, snapshots: list[WalletLabelSnapshot]) -> int:
-        """Upsert wallet label snapshots by timestamp and wallet.
+        """Replace current wallet labels with one row per qualifying wallet.
+
+        Existing rows absent from ``snapshots`` are deleted in the same
+        transaction. This removes wallets that have fallen below the rolling
+        notional threshold without retaining historical label snapshots.
 
         Args:
-            snapshots (list[WalletLabelSnapshot]): Computed snapshots to persist.
+            snapshots (list[WalletLabelSnapshot]): Current qualifying snapshots.
 
         Returns:
-            int: Number of rows submitted for upsert.
+            int: Number of current rows submitted for upsert.
 
         Raises:
             RuntimeError: If :meth:`connect` has not initialized the pool.
-            asyncpg.PostgresError: If the upsert fails.
+            asyncpg.PostgresError: If the replacement fails.
 
         """
-        if not snapshots:
-            return 0
         if not self._pool:
             raise RuntimeError("Pool not initialized")
 
@@ -243,7 +245,8 @@ class PostgresStore:
             $8, $9, $10,
             $11, $12, $13, $14, NOW()
         )
-        ON CONFLICT (bucket_ts, wallet) DO UPDATE SET
+        ON CONFLICT (wallet) DO UPDATE SET
+            bucket_ts = EXCLUDED.bucket_ts,
             taker_markout = EXCLUDED.taker_markout,
             realized_pnl = EXCLUDED.realized_pnl,
             liquidation_count = EXCLUDED.liquidation_count,
@@ -279,8 +282,15 @@ class PostgresStore:
             for s in snapshots
         ]
 
-        async with self._pool.acquire() as conn:
-            await conn.executemany(query, rows)
+        current_wallets = [snapshot.wallet for snapshot in snapshots]
+        async with self._pool.acquire() as conn, conn.transaction():
+            if rows:
+                await conn.executemany(query, rows)
+            await conn.execute(
+                "DELETE FROM wallet_flow_labels "
+                "WHERE NOT (wallet = ANY($1::text[]))",
+                current_wallets,
+            )
         return len(rows)
 
     @property
