@@ -117,14 +117,24 @@ WITH activity_24h AS (
     SELECT
         wallet,
         COUNT(*) AS event_count_24h,
-        SUM(ABS(COALESCE(notional, 0))) AS notional_volume_24h,
+        COUNT(*) FILTER (
+            WHERE event_type IN ('trade', 'fill', 'liquidation')
+        ) AS trade_count_24h,
         COUNT(*) FILTER (
             WHERE aggressor = 'taker'
-              AND event_type IN ('trade', 'fill')
+              AND event_type IN ('trade', 'fill', 'liquidation')
         ) AS taker_event_count_24h,
-        COUNT(*) FILTER (WHERE liquidation) AS liquidation_count_24h,
-        (COUNT(*) FILTER (WHERE liquidation))::float8
-            / NULLIF(COUNT(*), 0) AS liquidation_frequency_24h,
+        COUNT(*) FILTER (
+            WHERE liquidation
+              AND event_type IN ('trade', 'fill', 'liquidation')
+        ) AS liquidation_count_24h,
+        (COUNT(*) FILTER (
+            WHERE liquidation
+              AND event_type IN ('trade', 'fill', 'liquidation')
+        ))::float8
+            / NULLIF(COUNT(*) FILTER (
+                WHERE event_type IN ('trade', 'fill', 'liquidation')
+            ), 0) AS liquidation_ratio_24h,
         MIN(ts) AS first_event_24h,
         MAX(ts) AS latest_event_24h
     FROM orderflow_events
@@ -147,15 +157,26 @@ SELECT
     labels.bucket_ts,
     activity.wallet,
     activity.event_count_24h,
-    activity.notional_volume_24h,
+    activity.trade_count_24h,
     activity.taker_event_count_24h,
     activity.liquidation_count_24h,
-    activity.liquidation_frequency_24h,
+    activity.liquidation_ratio_24h,
     activity.first_event_24h,
     activity.latest_event_24h,
-    labels.taker_markout,
+    labels.trade_count AS lifetime_trade_count,
+    labels.markout_sample_count AS lifetime_markout_sample_count,
+    labels.markout_p10,
+    labels.markout_p20,
+    labels.markout_p30,
+    labels.markout_p40,
+    labels.markout_p50,
+    labels.markout_p60,
+    labels.markout_p70,
+    labels.markout_p80,
+    labels.markout_p90,
     labels.realized_pnl,
-    labels.taker_ratio,
+    labels.liquidation_ratio AS lifetime_liquidation_ratio,
+    labels.taker_ratio AS lifetime_taker_ratio,
     labels.cancel_to_fill_ratio,
     labels.message_cadence_per_min,
     labels.holding_time_sec_median,

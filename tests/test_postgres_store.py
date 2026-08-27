@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from importlib.resources import files
+from pathlib import Path
 from typing import Any, cast
 
 from hydromancer_eda.config import Settings
@@ -72,22 +73,43 @@ def store_with_connection() -> tuple[PostgresStore, Connection]:
     return store, connection
 
 
-def test_schema_replaces_only_obsolete_label_history() -> None:
+def test_schema_defines_lifetime_labels_without_destructive_migration() -> None:
     schema = files("hydromancer_eda.sql").joinpath("schema.sql").read_text(encoding="utf-8")
 
-    assert schema.index("DROP TABLE wallet_flow_labels CASCADE") < schema.index(
-        "CREATE TABLE IF NOT EXISTS wallet_flow_labels"
-    )
     assert "wallet TEXT PRIMARY KEY" in schema
-    assert "DROP TABLE orderflow_events" not in schema
-    assert "DROP TABLE ingestion_checkpoints" not in schema
+    assert "trade_count BIGINT" in schema
+    assert "markout_sample_count BIGINT" in schema
+    assert "markout_p10 DOUBLE PRECISION" in schema
+    assert "markout_p90 DOUBLE PRECISION" in schema
+    assert "liquidation_ratio DOUBLE PRECISION" in schema
+    assert "RAISE EXCEPTION" in schema
+    assert "run sql/reset_wallet_labels.sql before startup" in schema
+    assert "DROP TABLE wallet_flow_labels" not in schema
+    assert "TRUNCATE" not in schema
 
 
-def test_label_upsert_replaces_current_wallet_set() -> None:
+def test_explicit_reset_drops_only_wallet_labels() -> None:
+    reset_path = Path(__file__).parents[1] / "sql" / "reset_wallet_labels.sql"
+    reset = reset_path.read_text(encoding="utf-8")
+    statements = [line for line in reset.splitlines() if not line.startswith("--")]
+    executable = "\n".join(statements)
+
+    assert "DROP TABLE IF EXISTS public.wallet_flow_labels CASCADE" in executable
+    assert "orderflow_events" not in executable
+    assert "ingestion_checkpoints" not in executable
+    assert "TRUNCATE" not in executable
+
+
+def test_label_upsert_updates_without_pruning_lifetime_wallets() -> None:
     store, connection = store_with_connection()
     snapshot = WalletLabelSnapshot(
         bucket_ts=datetime(2025, 1, 1, tzinfo=UTC),
         wallet="0xabc",
+        trade_count=100,
+        markout_sample_count=50,
+        markout_p10=-0.02,
+        markout_p90=0.03,
+        liquidation_ratio=0.01,
         realized_pnl=12.5,
     )
 
@@ -96,30 +118,30 @@ def test_label_upsert_replaces_current_wallet_set() -> None:
     assert count == 1
     assert "ON CONFLICT (wallet) DO UPDATE" in connection.batch_query
     assert connection.batch_rows[0][1] == "0xabc"
-    assert "DELETE FROM wallet_flow_labels" in connection.execute_query
-    assert connection.execute_arguments == (["0xabc"],)
+    assert connection.batch_rows[0][2] == 100
+    assert connection.batch_rows[0][3] == 50
+    assert "markout_p10 = EXCLUDED.markout_p10" in connection.batch_query
+    assert "markout_p90 = EXCLUDED.markout_p90" in connection.batch_query
+    assert "liquidation_ratio = EXCLUDED.liquidation_ratio" in connection.batch_query
+    assert "taker_markout" not in connection.batch_query
+    assert "liquidation_count" not in connection.batch_query
+    assert "DELETE FROM wallet_flow_labels" not in connection.batch_query
+    assert connection.execute_query == ""
     assert connection.calls == [
         "acquire_enter",
         "transaction_enter",
         "executemany",
-        "execute",
         "transaction_exit",
         "acquire_exit",
     ]
 
 
-def test_empty_label_set_removes_all_current_wallets() -> None:
+def test_empty_label_set_does_not_prune_lifetime_wallets() -> None:
     store, connection = store_with_connection()
 
     count = asyncio.run(store.upsert_label_snapshots([]))
 
     assert count == 0
     assert connection.batch_query == ""
-    assert connection.execute_arguments == ([],)
-    assert connection.calls == [
-        "acquire_enter",
-        "transaction_enter",
-        "execute",
-        "transaction_exit",
-        "acquire_exit",
-    ]
+    assert connection.execute_query == ""
+    assert connection.calls == []

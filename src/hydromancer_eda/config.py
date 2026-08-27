@@ -1,6 +1,5 @@
 """Application settings for Hydromancer ingestion and wallet labeling."""
 
-from decimal import Decimal
 from functools import lru_cache
 
 from pydantic import Field, field_validator
@@ -15,12 +14,7 @@ class Settings(BaseSettings):
     hydromancer_api_key: str = Field(alias="HYDROMANCER_API_KEY", min_length=1)
     hydromancer_coins: str = Field(default="BTC,ETH", alias="HYDROMANCER_COINS")
     pg_dsn: str = Field(alias="PG_DSN")
-    pg_schema: str = Field(default="public", alias="PG_SCHEMA")
     label_markout_horizon_seconds: int = Field(default=60, alias="LABEL_MARKOUT_HORIZON_SECONDS")
-    label_agg_window_hours: int = Field(default=24, alias="LABEL_AGG_WINDOW_HOURS")
-    label_min_notional_24h: Decimal = Field(
-        default=Decimal(10000), alias="LABEL_MIN_NOTIONAL_24H", ge=0
-    )
     label_interval_seconds: int = Field(default=3600, alias="LABEL_INTERVAL_SECONDS", gt=0)
     reconnect_delay_seconds: float = Field(default=1.0, alias="HYDROMANCER_RECONNECT_DELAY_SECONDS", gt=0)
 

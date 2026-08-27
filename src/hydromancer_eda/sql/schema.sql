@@ -69,28 +69,60 @@ CREATE INDEX IF NOT EXISTS orderflow_events_wallet_ts_idx ON orderflow_events (w
 CREATE INDEX IF NOT EXISTS orderflow_events_symbol_ts_idx ON orderflow_events (symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS orderflow_events_type_ts_idx ON orderflow_events (event_type, ts DESC);
 
--- Labels are derived state, not event history. Replace any historical table
--- whose primary key is not exactly (wallet). CASCADE also removes dependencies
--- on the obsolete snapshot history. The next hourly pass repopulates the table.
+-- Labels are derived current state rather than event history. Schema changes to
+-- this table use the explicit sql/reset_wallet_labels.sql operation; startup
+-- schema initialization never truncates or migrates existing label rows.
 DO $$
 DECLARE
     labels_table REGCLASS := to_regclass('wallet_flow_labels');
 BEGIN
     IF labels_table IS NOT NULL
-       AND NOT EXISTS (
-           SELECT 1
-           FROM pg_constraint
-           WHERE conrelid = labels_table
-             AND contype = 'p'
-             AND conkey = ARRAY[
-                 (SELECT attnum
-                  FROM pg_attribute
-                  WHERE attrelid = labels_table
-                    AND attname = 'wallet')
-             ]::smallint[]
+       AND (
+           EXISTS (
+               SELECT 1
+               FROM unnest(ARRAY[
+                   'wallet', 'bucket_ts', 'trade_count', 'markout_sample_count',
+                   'markout_p10', 'markout_p20', 'markout_p30', 'markout_p40',
+                   'markout_p50', 'markout_p60', 'markout_p70', 'markout_p80',
+                   'markout_p90', 'realized_pnl', 'liquidation_ratio',
+                   'taker_ratio', 'cancel_to_fill_ratio',
+                   'message_cadence_per_min', 'holding_time_sec_median',
+                   'liquidity_provision_score', 'round_number_notional_ratio',
+                   'round_number_size_ratio', 'max_leverage',
+                   'cross_margin_ratio', 'updated_at'
+               ]) required(column_name)
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM pg_attribute
+                   WHERE attrelid = labels_table
+                     AND attname = required.column_name
+                     AND NOT attisdropped
+               )
+           )
+           OR EXISTS (
+               SELECT 1
+               FROM pg_attribute
+               WHERE attrelid = labels_table
+                 AND attname IN ('taker_markout', 'liquidation_count')
+                 AND NOT attisdropped
+           )
+           OR NOT EXISTS (
+               SELECT 1
+               FROM pg_constraint
+               WHERE conrelid = labels_table
+                 AND contype = 'p'
+                 AND conkey = ARRAY[
+                     (SELECT attnum
+                      FROM pg_attribute
+                      WHERE attrelid = labels_table
+                        AND attname = 'wallet'
+                        AND NOT attisdropped)
+                 ]::smallint[]
+           )
        )
     THEN
-        DROP TABLE wallet_flow_labels CASCADE;
+        RAISE EXCEPTION
+            'wallet_flow_labels has an obsolete schema; run sql/reset_wallet_labels.sql before startup';
     END IF;
 END $$;
 
@@ -98,9 +130,19 @@ CREATE TABLE IF NOT EXISTS wallet_flow_labels (
     wallet TEXT PRIMARY KEY,
     bucket_ts TIMESTAMPTZ NOT NULL,
 
-    taker_markout DOUBLE PRECISION,
+    trade_count BIGINT,
+    markout_sample_count BIGINT,
+    markout_p10 DOUBLE PRECISION,
+    markout_p20 DOUBLE PRECISION,
+    markout_p30 DOUBLE PRECISION,
+    markout_p40 DOUBLE PRECISION,
+    markout_p50 DOUBLE PRECISION,
+    markout_p60 DOUBLE PRECISION,
+    markout_p70 DOUBLE PRECISION,
+    markout_p80 DOUBLE PRECISION,
+    markout_p90 DOUBLE PRECISION,
     realized_pnl DOUBLE PRECISION,
-    liquidation_count BIGINT,
+    liquidation_ratio DOUBLE PRECISION,
     taker_ratio DOUBLE PRECISION,
     cancel_to_fill_ratio DOUBLE PRECISION,
     message_cadence_per_min DOUBLE PRECISION,

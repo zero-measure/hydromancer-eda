@@ -212,14 +212,14 @@ class PostgresStore:
         return len(rows)
 
     async def upsert_label_snapshots(self, snapshots: list[WalletLabelSnapshot]) -> int:
-        """Replace current wallet labels with one row per qualifying wallet.
+        """Upsert one current observed-lifetime label row per wallet.
 
-        Existing rows absent from ``snapshots`` are deleted in the same
-        transaction. This removes wallets that have fallen below the rolling
-        notional threshold without retaining historical label snapshots.
+        Lifetime wallets are never pruned from a partial or empty result. The
+        explicit label reset operation is responsible for removing obsolete
+        schema data.
 
         Args:
-            snapshots (list[WalletLabelSnapshot]): Current qualifying snapshots.
+            snapshots (list[WalletLabelSnapshot]): Current lifetime snapshots.
 
         Returns:
             int: Number of current rows submitted for upsert.
@@ -234,22 +234,36 @@ class PostgresStore:
 
         query = """
         INSERT INTO wallet_flow_labels (
-            bucket_ts, wallet, taker_markout, realized_pnl,
-            liquidation_count, taker_ratio, cancel_to_fill_ratio,
+            bucket_ts, wallet, trade_count, markout_sample_count,
+            markout_p10, markout_p20, markout_p30, markout_p40, markout_p50,
+            markout_p60, markout_p70, markout_p80, markout_p90,
+            realized_pnl, liquidation_ratio, taker_ratio, cancel_to_fill_ratio,
             message_cadence_per_min, holding_time_sec_median,
             liquidity_provision_score, round_number_notional_ratio,
             round_number_size_ratio, max_leverage, cross_margin_ratio, updated_at
         ) VALUES (
             $1, $2, $3, $4,
-            $5, $6, $7,
-            $8, $9, $10,
-            $11, $12, $13, $14, NOW()
+            $5, $6, $7, $8, $9,
+            $10, $11, $12, $13,
+            $14, $15, $16, $17,
+            $18, $19, $20, $21,
+            $22, $23, $24, NOW()
         )
         ON CONFLICT (wallet) DO UPDATE SET
             bucket_ts = EXCLUDED.bucket_ts,
-            taker_markout = EXCLUDED.taker_markout,
+            trade_count = EXCLUDED.trade_count,
+            markout_sample_count = EXCLUDED.markout_sample_count,
+            markout_p10 = EXCLUDED.markout_p10,
+            markout_p20 = EXCLUDED.markout_p20,
+            markout_p30 = EXCLUDED.markout_p30,
+            markout_p40 = EXCLUDED.markout_p40,
+            markout_p50 = EXCLUDED.markout_p50,
+            markout_p60 = EXCLUDED.markout_p60,
+            markout_p70 = EXCLUDED.markout_p70,
+            markout_p80 = EXCLUDED.markout_p80,
+            markout_p90 = EXCLUDED.markout_p90,
             realized_pnl = EXCLUDED.realized_pnl,
-            liquidation_count = EXCLUDED.liquidation_count,
+            liquidation_ratio = EXCLUDED.liquidation_ratio,
             taker_ratio = EXCLUDED.taker_ratio,
             cancel_to_fill_ratio = EXCLUDED.cancel_to_fill_ratio,
             message_cadence_per_min = EXCLUDED.message_cadence_per_min,
@@ -266,9 +280,19 @@ class PostgresStore:
             (
                 s.bucket_ts,
                 s.wallet,
-                s.taker_markout,
+                s.trade_count,
+                s.markout_sample_count,
+                s.markout_p10,
+                s.markout_p20,
+                s.markout_p30,
+                s.markout_p40,
+                s.markout_p50,
+                s.markout_p60,
+                s.markout_p70,
+                s.markout_p80,
+                s.markout_p90,
                 s.realized_pnl,
-                s.liquidation_count,
+                s.liquidation_ratio,
                 s.taker_ratio,
                 s.cancel_to_fill_ratio,
                 s.message_cadence_per_min,
@@ -282,15 +306,10 @@ class PostgresStore:
             for s in snapshots
         ]
 
-        current_wallets = [snapshot.wallet for snapshot in snapshots]
+        if not rows:
+            return 0
         async with self._pool.acquire() as conn, conn.transaction():
-            if rows:
-                await conn.executemany(query, rows)
-            await conn.execute(
-                "DELETE FROM wallet_flow_labels "
-                "WHERE NOT (wallet = ANY($1::text[]))",
-                current_wallets,
-            )
+            await conn.executemany(query, rows)
         return len(rows)
 
     @property

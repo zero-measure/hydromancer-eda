@@ -169,18 +169,28 @@ class OrderflowEvent(BaseModel):
 class WalletLabelSnapshot(BaseModel):
     """Represent wallet-flow metrics computed for one aggregation timestamp.
 
-    Optional fields cover taker markout, realized performance, liquidation and
-    message activity, holding time, liquidity provision, notional preferences,
-    leverage, and margin-mode usage. A value is ``None`` when source events are
-    insufficient to calculate the metric.
+    Optional fields cover lifetime trade activity, taker-markout deciles,
+    realized performance, liquidations, message cadence, holding time, liquidity
+    provision, notional preferences, leverage, and margin-mode usage. A value is
+    ``None`` when source events are insufficient to calculate the metric.
     """
 
     bucket_ts: datetime
     wallet: str
 
-    taker_markout: float | None = None
+    trade_count: int | None = None
+    markout_sample_count: int | None = None
+    markout_p10: float | None = None
+    markout_p20: float | None = None
+    markout_p30: float | None = None
+    markout_p40: float | None = None
+    markout_p50: float | None = None
+    markout_p60: float | None = None
+    markout_p70: float | None = None
+    markout_p80: float | None = None
+    markout_p90: float | None = None
     realized_pnl: float | None = None
-    liquidation_count: int | None = None
+    liquidation_ratio: float | None = None
     taker_ratio: float | None = None
     cancel_to_fill_ratio: float | None = None
     message_cadence_per_min: float | None = None

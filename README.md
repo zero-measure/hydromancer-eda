@@ -106,7 +106,7 @@ At startup, the application reads `src/hydromancer_eda/sql/schema.sql` from the 
 - `orderflow_events` for normalized participant-level fills
 - `ingestion_checkpoints` for the durable session and opaque cursor
 - `ingestion_rejects` for malformed upstream entries
-- `wallet_flow_labels` for one current metric row per qualifying wallet
+- `wallet_flow_labels` for one current lifetime-metric row per observed wallet
 
 Inspect row counts from the Docker database:
 
@@ -116,18 +116,32 @@ docker exec hydromancer-timescaledb \
   --command='SELECT COUNT(*) FROM orderflow_events;'
 ```
 
-Wallet labels are recomputed hourly over a rolling 24-hour window. Wallets with
-less than `$10,000` in gross absolute notional during that window are omitted,
-and wallets that fall below the threshold are removed from `wallet_flow_labels`.
-Only one current label row is retained per qualifying wallet. Configure these
-controls with `LABEL_AGG_WINDOW_HOURS`, `LABEL_MIN_NOTIONAL_24H`, and
-`LABEL_INTERVAL_SECONDS`. The minimum is applied over the configured aggregation
-window, so keep `LABEL_AGG_WINDOW_HOURS=24` for the named 24-hour threshold.
+Wallet labels are recomputed hourly from all events observed through the label
+snapshot timestamp. Each wallet retains one current row containing lifetime
+trade count, taker ratio, liquidation ratio, signed taker-markout deciles and
+sample count, performance, cadence, and behavioral metrics. Cadence uses the
+wallet's observed span (`MAX(ts) - MIN(ts)`) and is `NULL` until a wallet has
+observations at two distinct timestamps. Configure the refresh cadence and
+markout horizon with `LABEL_INTERVAL_SECONDS` and
+`LABEL_MARKOUT_HORIZON_SECONDS`.
 
-On the first startup after upgrading from historical label snapshots, schema
-initialization drops the old derived `wallet_flow_labels` hypertable. The first
-label pass repopulates the new current-state table; raw
-`orderflow_events` and ingestion checkpoints are not removed.
+The lifetime-label schema deliberately does not migrate obsolete label rows. To
+perform the one-time reset, stop ingestion, drop only the derived label table,
+and restart ingestion so packaged schema initialization recreates it:
+
+```bash
+docker exec -i hydromancer-timescaledb \
+  psql --username postgres --dbname hydromancer \
+  < sql/reset_wallet_labels.sql
+
+PYTHONPATH=src python -m hydromancer_eda.main
+```
+
+The application currently uses the `public` schema. This reset preserves
+`orderflow_events`, `ingestion_checkpoints`, and `ingestion_rejects`. The first
+label pass reconstructs lifetime labels from the retained order-flow history.
+If the reset is skipped, startup fails fast with the reset instruction instead
+of running against obsolete label columns.
 
 `HYDROMANCER_BUILDER_ADDRESS` is not used or required.
 
