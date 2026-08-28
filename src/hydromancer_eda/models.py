@@ -1,4 +1,4 @@
-"""Canonical models for normalized order flow and wallet label snapshots."""
+"""Canonical models for flow, book, leverage, and wallet-label data."""
 
 from __future__ import annotations
 
@@ -8,23 +8,12 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
-EventType = Literal["trade", "fill", "cancel", "liquidation", "position_open", "position_close"]
 Aggressor = Literal["taker", "maker", "unknown"]
 Side = Literal["buy", "sell", "unknown"]
-MarginMode = Literal["cross", "isolated", "unknown"]
 
 
 def _first_present(payload: dict[str, Any], *keys: str) -> Any:
-    """Return the first present, non-null payload value.
-
-    Args:
-        payload (dict[str, Any]): Mapping to inspect.
-        *keys (str): Candidate keys in descending priority order.
-
-    Returns:
-        Any: First non-null value, including valid falsy values, or ``None``.
-
-    """
+    """Return the first present, non-null payload value."""
     for key in keys:
         value = payload.get(key)
         if value is not None:
@@ -33,51 +22,28 @@ def _first_present(payload: dict[str, Any], *keys: str) -> Any:
 
 
 class OrderflowEvent(BaseModel):
-    """Represent one normalized participant-level allFills event.
-
-    Unknown side, aggressor, and margin values normalize to ``"unknown"``.
-    The ``raw`` field retains the ingestion payload, including its canonical
-    envelope wallet address.
-    """
+    """Represent one normalized participant-level allFills execution."""
 
     ts: datetime
     symbol: str
     wallet: str
-    event_type: EventType = "trade"
     side: Side = "unknown"
     aggressor: Aggressor = "unknown"
-
-    price: Decimal | None = None
-    size: Decimal | None = None
-    notional: Decimal | None = None
-    leverage: Decimal | None = None
-    margin_mode: MarginMode = "unknown"
-
+    price: Decimal
+    size: Decimal
+    notional: Decimal
     order_id: str | None = None
     trade_id: str | None = None
-    position_id: str | None = None
     tx_index: int
-
     realized_pnl: Decimal | None = None
     liquidation: bool = False
-
-    raw: dict[str, Any] = Field(default_factory=dict)
+    liquidation_mark_price: Decimal | None = None
+    liquidation_method: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @staticmethod
     def timestamp_from_hydromancer(payload: dict[str, Any]) -> datetime:
-        """Parse a Hydromancer timestamp as a timezone-aware datetime.
-
-        Args:
-            payload (dict[str, Any]): Fill payload containing ``time``, ``ts``,
-                or ``timestamp`` as epoch milliseconds or an ISO-8601 string.
-
-        Returns:
-            datetime: Parsed timestamp; naive strings are interpreted as UTC.
-
-        Raises:
-            ValueError: If no supported timestamp value is present or parseable.
-
-        """
+        """Parse a Hydromancer timestamp as a timezone-aware datetime."""
         ts_value = _first_present(payload, "time", "ts", "timestamp")
         if isinstance(ts_value, (int, float)) and not isinstance(ts_value, bool):
             return datetime.fromtimestamp(ts_value / 1000, tz=UTC)
@@ -88,115 +54,161 @@ class OrderflowEvent(BaseModel):
 
     @classmethod
     def from_hydromancer(cls, payload: dict[str, Any]) -> OrderflowEvent:
-        """Normalize a Hydromancer fill into an order-flow event.
-
-        Args:
-            payload (dict[str, Any]): Fill payload augmented with the canonical
-                allFills envelope address.
-
-        Returns:
-            OrderflowEvent: Validated participant-level event.
-
-        Raises:
-            KeyError: If the required ``txIndex`` field is absent.
-            TypeError: If a required numeric value has an unsupported type.
-            ValueError: If required identity fields or numeric values are invalid.
-            ArithmeticError: If derived notional arithmetic fails.
-
-        """
+        """Normalize a Hydromancer participant fill."""
         ts = cls.timestamp_from_hydromancer(payload)
-        price = _first_present(payload, "px", "price")
-        size = _first_present(payload, "sz", "size")
-        notional = payload.get("notional")
-        if notional is None and price is not None and size is not None:
-            notional = Decimal(str(price)) * Decimal(str(size))
+        price_value = _first_present(payload, "px", "price")
+        size_value = _first_present(payload, "sz", "size")
+        if price_value is None or size_value is None:
+            raise ValueError("Missing fill price or size")
+        price = Decimal(str(price_value))
+        size = Decimal(str(size_value))
 
         side_raw = str(payload.get("side", "unknown")).lower()
-        side = cast(Side, {"b": "buy", "buy": "buy", "a": "sell", "sell": "sell"}.get(side_raw, "unknown"))
+        side = cast(
+            Side,
+            {"b": "buy", "buy": "buy", "a": "sell", "sell": "sell"}.get(
+                side_raw, "unknown"
+            ),
+        )
         aggressor_raw = str(payload.get("aggressor", "")).lower()
         if not aggressor_raw:
             crossed = payload.get("crossed")
             aggressor_raw = (
                 "taker" if crossed is True else "maker" if crossed is False else "unknown"
             )
-        aggressor = cast(Aggressor, aggressor_raw if aggressor_raw in {"taker", "maker"} else "unknown")
-        margin_raw = str(payload.get("margin_mode", "unknown")).lower()
-        margin_mode = cast(MarginMode, margin_raw if margin_raw in {"cross", "isolated"} else "unknown")
+        aggressor = cast(
+            Aggressor,
+            aggressor_raw if aggressor_raw in {"taker", "maker"} else "unknown",
+        )
 
-        direction = str(payload.get("dir", "")).lower()
-        liquidation = bool(payload.get("liquidation", False) or "liquidat" in direction)
-        # allFills defines the envelope address as the participant identity.
         wallet_value = _first_present(payload, "address", "user", "wallet")
         wallet = "" if wallet_value is None else str(wallet_value).strip().lower()
-        if not wallet:
-            raise ValueError("Missing wallet in payload")
         symbol_value = _first_present(payload, "coin", "symbol")
         symbol = "" if symbol_value is None else str(symbol_value).strip()
-        if not symbol:
-            raise ValueError("Missing symbol in payload")
+        if not wallet or not symbol:
+            raise ValueError("Missing wallet or symbol")
 
+        liquidation_data = payload.get("liquidation")
+        liquidation_details = liquidation_data if isinstance(liquidation_data, dict) else None
+        liquidated_user = (
+            str(liquidation_details.get("liquidatedUser", "")).strip().lower()
+            if liquidation_details
+            else ""
+        )
+        liquidation = bool(liquidated_user and liquidated_user == wallet)
+        liquidation_mark = liquidation_details.get("markPx") if liquidation_details else None
+        liquidation_method = liquidation_details.get("method") if liquidation_details else None
+        notional_value = payload.get("notional")
+        notional = (
+            Decimal(str(notional_value))
+            if notional_value is not None
+            else abs(price * size)
+        )
         oid = _first_present(payload, "oid", "order_id")
         tid = _first_present(payload, "tid", "trade_id")
-        position_id = payload.get("position_id")
         realized_pnl = _first_present(payload, "closedPnl", "realized_pnl")
 
         return cls(
             ts=ts,
             symbol=symbol,
             wallet=wallet,
-            event_type="liquidation" if liquidation else "trade",
             side=side,
             aggressor=aggressor,
-            price=Decimal(str(price)) if price is not None else None,
-            size=Decimal(str(size)) if size is not None else None,
-            notional=Decimal(str(notional)) if notional is not None else None,
-            leverage=(
-                Decimal(str(payload["leverage"]))
-                if payload.get("leverage") is not None
-                else None
-            ),
-            margin_mode=margin_mode,
+            price=price,
+            size=size,
+            notional=notional,
             order_id=None if oid is None else str(oid),
             trade_id=None if tid is None else str(tid),
-            position_id=None if position_id is None else str(position_id),
             tx_index=int(payload["txIndex"]),
             realized_pnl=Decimal(str(realized_pnl)) if realized_pnl is not None else None,
             liquidation=liquidation,
+            liquidation_mark_price=(
+                Decimal(str(liquidation_mark))
+                if liquidation and liquidation_mark is not None
+                else None
+            ),
+            liquidation_method=(
+                str(liquidation_method)
+                if liquidation and liquidation_method is not None
+                else None
+            ),
             raw=payload,
         )
 
 
-class WalletLabelSnapshot(BaseModel):
-    """Represent wallet-flow metrics computed for one aggregation timestamp.
+class L2BookTick(BaseModel):
+    """Represent one post-diff per-coin L2 book state."""
 
-    Optional fields cover lifetime trade activity, taker-markout deciles,
-    realized performance, liquidations, message cadence, holding time, liquidity
-    provision, notional preferences, leverage, and margin-mode usage. A value is
-    ``None`` when source events are insufficient to calculate the metric.
-    """
+    ts: datetime
+    symbol: str
+    height: int
+    epoch: str
+    source_seq: int
+    event_no: int
+    best_bid: Decimal
+    best_ask: Decimal
+    mid_price: Decimal
+    spread_bps: float
+    bid_size: Decimal
+    ask_size: Decimal
+    imbalance: float
+    trailing_event_volatility: float | None = None
+
+
+class L4OrderEvent(BaseModel):
+    """Represent one wallet-attributed L4 order lifecycle update."""
+
+    ts: datetime
+    height: int
+    event_index: int
+    symbol: str
+    order_id: str
+    wallet: str | None = None
+    event_type: Literal["new", "update", "remove"]
+    side: Side = "unknown"
+    price: Decimal | None = None
+    size: Decimal | None = None
+    resting_seconds: float | None = None
+    aggregate: bool = Field(default=True, exclude=True)
+
+
+class LeverageUpdate(BaseModel):
+    """Represent one leverage or isolated-margin update."""
+
+    ts: datetime
+    wallet: str
+    symbol: str
+    update_type: Literal["leverage", "isolated_margin", "top_up_isolated_margin"]
+    leverage: float | None = None
+    is_cross: bool | None = None
+    is_buy: bool | None = None
+    ntli: Decimal | None = None
+    tx_index: int
+
+
+MarkoutMetrics = dict[str, dict[str, float | int | None]]
+
+
+class WalletLabelSnapshot(BaseModel):
+    """Represent one current toxic-flow classifier feature row per wallet."""
 
     bucket_ts: datetime
     wallet: str
-
-    trade_count: int | None = None
-    markout_sample_count: int | None = None
-    markout_p10: float | None = None
-    markout_p20: float | None = None
-    markout_p30: float | None = None
-    markout_p40: float | None = None
-    markout_p50: float | None = None
-    markout_p60: float | None = None
-    markout_p70: float | None = None
-    markout_p80: float | None = None
-    markout_p90: float | None = None
-    realized_pnl: float | None = None
-    liquidation_ratio: float | None = None
+    trade_count: int
     taker_ratio: float | None = None
-    cancel_to_fill_ratio: float | None = None
-    message_cadence_per_min: float | None = None
-    holding_time_sec_median: float | None = None
-    liquidity_provision_score: float | None = None
+    liquidation_ratio: float | None = None
     round_number_notional_ratio: float | None = None
     round_number_size_ratio: float | None = None
+    message_cadence_per_min: float | None = None
+    realized_pnl: float | None = None
     max_leverage: float | None = None
-    cross_margin_ratio: float | None = None
+    current_max_leverage: float | None = None
+    leverage_update_count: int = 0
+    isolated_margin_update_count: int = 0
+    order_new_count: int = 0
+    order_update_count: int = 0
+    order_remove_count: int = 0
+    order_remove_ratio: float | None = None
+    round_order_size_ratio: float | None = None
+    average_order_lifetime_seconds: float | None = None
+    markout_metrics: MarkoutMetrics = Field(default_factory=dict)

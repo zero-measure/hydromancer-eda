@@ -10,36 +10,24 @@ from hydromancer_eda.storage.postgres import PostgresStore
 
 
 class Transaction:
-    def __init__(self, connection: "Connection") -> None:
-        self.connection = connection
-
     async def __aenter__(self) -> None:
-        self.connection.calls.append("transaction_enter")
+        return None
 
     async def __aexit__(self, *_args: object) -> None:
-        self.connection.calls.append("transaction_exit")
+        return None
 
 
 class Connection:
     def __init__(self) -> None:
-        self.batch_query = ""
-        self.batch_rows: list[tuple[object, ...]] = []
-        self.execute_query = ""
-        self.execute_arguments: tuple[object, ...] = ()
-        self.calls: list[str] = []
+        self.query = ""
+        self.rows: list[tuple[object, ...]] = []
 
     def transaction(self) -> Transaction:
-        return Transaction(self)
+        return Transaction()
 
     async def executemany(self, query: str, rows: list[tuple[object, ...]]) -> None:
-        self.calls.append("executemany")
-        self.batch_query = query
-        self.batch_rows = rows
-
-    async def execute(self, query: str, *arguments: object) -> None:
-        self.calls.append("execute")
-        self.execute_query = query
-        self.execute_arguments = arguments
+        self.query = query
+        self.rows = rows
 
 
 class AcquireConnection:
@@ -47,11 +35,10 @@ class AcquireConnection:
         self.connection = connection
 
     async def __aenter__(self) -> Connection:
-        self.connection.calls.append("acquire_enter")
         return self.connection
 
     async def __aexit__(self, *_args: object) -> None:
-        self.connection.calls.append("acquire_exit")
+        return None
 
 
 class Pool:
@@ -73,75 +60,73 @@ def store_with_connection() -> tuple[PostgresStore, Connection]:
     return store, connection
 
 
-def test_schema_defines_lifetime_labels_without_destructive_migration() -> None:
+def test_schema_contains_only_explicit_reset_for_destructive_changes() -> None:
     schema = files("hydromancer_eda.sql").joinpath("schema.sql").read_text(encoding="utf-8")
 
-    assert "wallet TEXT PRIMARY KEY" in schema
-    assert "trade_count BIGINT" in schema
-    assert "markout_sample_count BIGINT" in schema
-    assert "markout_p10 DOUBLE PRECISION" in schema
-    assert "markout_p90 DOUBLE PRECISION" in schema
-    assert "liquidation_ratio DOUBLE PRECISION" in schema
-    assert "RAISE EXCEPTION" in schema
-    assert "run sql/reset_wallet_labels.sql before startup" in schema
-    assert "DROP TABLE wallet_flow_labels" not in schema
+    assert "l2_book_ticks" in schema
+    assert "l2_book_state" in schema
+    assert "l2_book_levels" in schema
+    assert "l4_order_events" in schema
+    assert "wallet_order_aggregates" in schema
+    assert "leverage_updates" in schema
+    assert "wallet_leverage_state" in schema
+    assert "wallet_markout_samples" in schema
+    assert "markout_metrics JSONB" in schema
+    assert "DROP TABLE" not in schema
     assert "TRUNCATE" not in schema
 
 
-def test_explicit_reset_drops_only_wallet_labels() -> None:
-    reset_path = Path(__file__).parents[1] / "sql" / "reset_wallet_labels.sql"
-    reset = reset_path.read_text(encoding="utf-8")
-    statements = [line for line in reset.splitlines() if not line.startswith("--")]
-    executable = "\n".join(statements)
+def test_explicit_reset_removes_all_analytics_but_not_operational_state() -> None:
+    reset = (Path(__file__).parents[1] / "sql" / "reset_analytics.sql").read_text()
+    executable = "\n".join(
+        line for line in reset.splitlines() if not line.startswith("--")
+    )
 
-    assert "DROP TABLE IF EXISTS public.wallet_flow_labels CASCADE" in executable
-    assert "orderflow_events" not in executable
+    for table in (
+        "orderflow_events",
+        "l2_book_ticks",
+        "l2_event_counters",
+        "l2_book_state",
+        "l2_book_levels",
+        "l4_order_events",
+        "wallet_order_aggregates",
+        "leverage_updates",
+        "wallet_leverage_state",
+        "wallet_markout_samples",
+        "wallet_flow_labels",
+    ):
+        assert f"DROP TABLE IF EXISTS public.{table} CASCADE" in executable
     assert "ingestion_checkpoints" not in executable
+    assert "ingestion_rejects" not in executable
     assert "TRUNCATE" not in executable
 
 
-def test_label_upsert_updates_without_pruning_lifetime_wallets() -> None:
+def test_label_upsert_persists_compact_classifier_features() -> None:
     store, connection = store_with_connection()
     snapshot = WalletLabelSnapshot(
         bucket_ts=datetime(2025, 1, 1, tzinfo=UTC),
         wallet="0xabc",
         trade_count=100,
-        markout_sample_count=50,
-        markout_p10=-0.02,
-        markout_p90=0.03,
-        liquidation_ratio=0.01,
-        realized_pnl=12.5,
+        taker_ratio=0.9,
+        liquidation_ratio=0.1,
+        max_leverage=20,
+        order_remove_ratio=0.5,
+        markout_metrics={"50": {"sample_count": 40, "p50": -1.2}},
     )
 
     count = asyncio.run(store.upsert_label_snapshots([snapshot]))
 
     assert count == 1
-    assert "ON CONFLICT (wallet) DO UPDATE" in connection.batch_query
-    assert connection.batch_rows[0][1] == "0xabc"
-    assert connection.batch_rows[0][2] == 100
-    assert connection.batch_rows[0][3] == 50
-    assert "markout_p10 = EXCLUDED.markout_p10" in connection.batch_query
-    assert "markout_p90 = EXCLUDED.markout_p90" in connection.batch_query
-    assert "liquidation_ratio = EXCLUDED.liquidation_ratio" in connection.batch_query
-    assert "taker_markout" not in connection.batch_query
-    assert "liquidation_count" not in connection.batch_query
-    assert "DELETE FROM wallet_flow_labels" not in connection.batch_query
-    assert connection.execute_query == ""
-    assert connection.calls == [
-        "acquire_enter",
-        "transaction_enter",
-        "executemany",
-        "transaction_exit",
-        "acquire_exit",
-    ]
+    assert "ON CONFLICT (wallet) DO UPDATE" in connection.query
+    assert "markout_metrics = EXCLUDED.markout_metrics" in connection.query
+    assert "holding_time_sec_median" not in connection.query
+    assert "cancel_to_fill_ratio" not in connection.query
+    assert connection.rows[0][1] == "0xabc"
+    assert '"sample_count": 40' in cast(str, connection.rows[0][19])
 
 
-def test_empty_label_set_does_not_prune_lifetime_wallets() -> None:
+def test_empty_label_result_never_prunes_wallets() -> None:
     store, connection = store_with_connection()
 
-    count = asyncio.run(store.upsert_label_snapshots([]))
-
-    assert count == 0
-    assert connection.batch_query == ""
-    assert connection.execute_query == ""
-    assert connection.calls == []
+    assert asyncio.run(store.upsert_label_snapshots([])) == 0
+    assert connection.query == ""

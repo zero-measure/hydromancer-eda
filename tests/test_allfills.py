@@ -123,24 +123,51 @@ def test_reconnected_without_replay_flushes_buffered_live_frames():
     asyncio.run(run())
 
 
-def test_duplicate_only_cursor_only_and_missing_sequence_reports_gap(caplog):
+def test_missing_live_sequence_reconnects_without_advancing_cursor(caplog):
     async def run():
         store, sent = Store(), []
+
         async def send(frame):
             sent.append(frame)
+
         service = AllFillsIngestionService(settings(), store)
         quiet(service)
-        await service.handle_message({"type": "connected", "sessionId": "s", "liveFormat": LIVE_FORMAT}, send)
-        await service.handle_message({"type": "allFills", "channel": "allFills", "seq": 1, "cursor": "one", "fills": [fill()]}, send)
-        # A different batch may interleave, but every received channel frame still
-        # has a contiguous seq; jumping from 1 to 3 means frame 2 was lost.
-        await service.handle_message({"type": "allFills", "channel": "allFills", "seq": 3, "cursor": "two", "fills": [fill(11)], "chunk": 1, "totalChunks": 1, "batchId": 9}, send)
-        await service.handle_message({"type": "allFills", "channel": "allFills", "seq": 4, "cursor": "three", "fills": [fill(12)], "chunk": 2, "totalChunks": 2, "batchId": 7}, send)
-        await service.handle_message({"type": "allFills", "channel": "allFills", "seq": 5, "cursor": "four", "fills": [fill()]}, send)
-        assert store.frames[-1][0] == [] and store.frames[-1][2] == "four"
+        await service.handle_message(
+            {"type": "connected", "sessionId": "s", "liveFormat": LIVE_FORMAT}, send
+        )
+        await service.handle_message(
+            {"type": "allFills", "channel": "allFills", "seq": 1, "cursor": "one", "fills": [fill()]}, send
+        )
+        with pytest.raises(ReplayOrderError):
+            await service.handle_message(
+                {"type": "allFills", "channel": "allFills", "seq": 3, "cursor": "two", "fills": [fill(11)]},
+                send,
+            )
+        assert store.frames[-1][2] == "one"
+
     with caplog.at_level(logging.WARNING):
         asyncio.run(run())
-    assert "allFills sequence gap: expected 2, got 3" in caplog.text
+    assert "sequence gap; reconnecting" in caplog.text
+
+
+def test_only_liquidated_participant_is_flagged() -> None:
+    details = {
+        "liquidatedUser": "0xvictim",
+        "markPx": "90",
+        "method": "market",
+    }
+    victim_payload = dict(fill(address="0xvictim")[1], address="0xvictim", liquidation=details)
+    counterparty_payload = dict(
+        fill(address="0xmaker")[1], address="0xmaker", liquidation=details
+    )
+
+    victim = OrderflowEvent.from_hydromancer(victim_payload)
+    counterparty = OrderflowEvent.from_hydromancer(counterparty_payload)
+
+    assert victim.liquidation is True
+    assert victim.liquidation_mark_price == 90
+    assert counterparty.liquidation is False
+    assert counterparty.liquidation_mark_price is None
 
 
 def test_case_sensitive_coin_identity_is_preserved():

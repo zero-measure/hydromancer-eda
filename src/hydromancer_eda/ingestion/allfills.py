@@ -21,7 +21,7 @@ from hydromancer_eda.storage.postgres import PostgresStore
 logger = logging.getLogger(__name__)
 FrameSender = Callable[[dict[str, Any]], Awaitable[None]]
 FillIdentity = tuple[str, str | None, str | None, str]
-REPLAY_GRACE_SECONDS = 2.0
+REPLAY_GRACE_SECONDS = 10.0
 MAX_BUFFERED_LIVE = 4096
 MAX_BACKOFF_EXPONENT = 5
 
@@ -244,7 +244,7 @@ class AllFillsIngestionService:
         if not self._replay_complete:
             now = time.monotonic()
             self._buffer_deadline = self._buffer_deadline or now + REPLAY_GRACE_SECONDS
-            if now < self._buffer_deadline:
+            if self._replay_total is not None or now < self._buffer_deadline:
                 if len(self._buffered_live) >= MAX_BUFFERED_LIVE:
                     logger.warning("replay/live buffer limit reached; starting a cursor-based session")
                     # Force a fresh session and manual cursor replay rather than
@@ -282,11 +282,8 @@ class AllFillsIngestionService:
         # Chunks from different batchIds may interleave, but the overall stream
         # remains contiguous; a skipped value therefore indicates a lost frame.
         if self._last_seq and seq != self._last_seq + 1:
-            logger.warning(
-                "allFills sequence gap: expected %d, got %d",
-                self._last_seq + 1,
-                seq,
-            )
+            logger.warning("allFills sequence gap; reconnecting from durable cursor")
+            raise ReplayOrderError
         await self._process_entries(fills, cursor)
         self._last_seq = seq
 

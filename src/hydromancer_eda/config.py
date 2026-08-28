@@ -14,8 +14,13 @@ class Settings(BaseSettings):
     hydromancer_api_key: str = Field(alias="HYDROMANCER_API_KEY", min_length=1)
     hydromancer_coins: str = Field(default="BTC,ETH", alias="HYDROMANCER_COINS")
     pg_dsn: str = Field(alias="PG_DSN")
-    label_markout_horizon_seconds: int = Field(default=60, alias="LABEL_MARKOUT_HORIZON_SECONDS")
     label_interval_seconds: int = Field(default=3600, alias="LABEL_INTERVAL_SECONDS", gt=0)
+    l2_volatility_lookback: int = Field(default=1000, alias="L2_VOLATILITY_LOOKBACK", ge=20)
+    l2_volatility_min_samples: int = Field(
+        default=20, alias="L2_VOLATILITY_MIN_SAMPLES", ge=2
+    )
+    l2_retention_hours: int = Field(default=168, alias="L2_RETENTION_HOURS", gt=0)
+    l4_retention_hours: int = Field(default=24, alias="L4_RETENTION_HOURS", gt=0)
     reconnect_delay_seconds: float = Field(default=1.0, alias="HYDROMANCER_RECONNECT_DELAY_SECONDS", gt=0)
 
     @field_validator("hydromancer_coins")

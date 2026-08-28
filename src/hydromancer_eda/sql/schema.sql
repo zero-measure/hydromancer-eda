@@ -1,50 +1,30 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
-CREATE TABLE IF NOT EXISTS orderflow_events (
-    id BIGSERIAL,
-    ts TIMESTAMPTZ NOT NULL,
-    symbol TEXT NOT NULL,
-    wallet TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    side TEXT NOT NULL,
-    aggressor TEXT NOT NULL,
-    price NUMERIC,
-    size NUMERIC,
-    notional NUMERIC,
-    leverage NUMERIC,
-    margin_mode TEXT NOT NULL,
-    order_id TEXT,
-    trade_id TEXT,
-    position_id TEXT,
-    tx_index BIGINT NOT NULL,
-    realized_pnl NUMERIC,
-    liquidation BOOLEAN NOT NULL DEFAULT FALSE,
-    raw JSONB NOT NULL,
-    PRIMARY KEY (id, ts)
-);
-
-SELECT create_hypertable('orderflow_events', by_range('ts'), if_not_exists => TRUE, migrate_data => TRUE);
-
--- Migration for databases created before trade_id was introduced.
-ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS trade_id TEXT;
-ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS tx_index BIGINT;
+-- Version 2 deliberately requires the explicit analytical reset. Startup never
+-- drops or rewrites analytical history behind the operator's back.
 DO $$
+DECLARE
+    current_version INTEGER;
 BEGIN
-    -- A market-wide fill emits one entry per participant. Replace the old
-    -- timestamp/transaction watermark index, which lost counterparties.
-    IF to_regclass('orderflow_events_dedupe_idx') IS NOT NULL
-       AND pg_get_indexdef(to_regclass('orderflow_events_dedupe_idx')) NOT LIKE '%wallet%'
+    IF to_regclass('analytics_schema_meta') IS NOT NULL THEN
+        EXECUTE 'SELECT MAX(version) FROM analytics_schema_meta' INTO current_version;
+    END IF;
+    IF to_regclass('orderflow_events') IS NOT NULL
+       AND current_version IS DISTINCT FROM 2
     THEN
-        DROP INDEX orderflow_events_dedupe_idx;
+        RAISE EXCEPTION
+            'obsolete analytics schema; stop ingestion and run sql/reset_analytics.sql';
     END IF;
 END $$;
--- Keep every participant at (time, txIndex); tid is the documented fill ID.
--- oid and side make the identity stable when a fill ID is absent.
-CREATE UNIQUE INDEX IF NOT EXISTS orderflow_events_dedupe_idx
-ON orderflow_events (ts, tx_index, wallet, COALESCE(trade_id, ''), COALESCE(order_id, ''), side)
-WHERE tx_index IS NOT NULL;
 
--- Exactly one simple durable resume row is kept per WebSocket channel.
+CREATE TABLE IF NOT EXISTS analytics_schema_meta (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    version INTEGER NOT NULL
+);
+INSERT INTO analytics_schema_meta (singleton, version)
+VALUES (TRUE, 2)
+ON CONFLICT (singleton) DO UPDATE SET version = EXCLUDED.version;
+
 CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     channel TEXT PRIMARY KEY,
     session_id TEXT,
@@ -52,8 +32,6 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Malformed upstream entries are retained atomically with cursor progress so a
--- poison entry cannot either disappear silently or halt market-wide ingestion.
 CREATE TABLE IF NOT EXISTS ingestion_rejects (
     id BIGSERIAL PRIMARY KEY,
     channel TEXT NOT NULL,
@@ -65,93 +43,187 @@ CREATE TABLE IF NOT EXISTS ingestion_rejects (
 CREATE INDEX IF NOT EXISTS ingestion_rejects_created_at_idx
 ON ingestion_rejects (created_at DESC);
 
-CREATE INDEX IF NOT EXISTS orderflow_events_wallet_ts_idx ON orderflow_events (wallet, ts DESC);
-CREATE INDEX IF NOT EXISTS orderflow_events_symbol_ts_idx ON orderflow_events (symbol, ts DESC);
-CREATE INDEX IF NOT EXISTS orderflow_events_type_ts_idx ON orderflow_events (event_type, ts DESC);
+CREATE TABLE IF NOT EXISTS orderflow_events (
+    id BIGSERIAL,
+    ts TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    wallet TEXT NOT NULL,
+    side TEXT NOT NULL,
+    aggressor TEXT NOT NULL,
+    price NUMERIC NOT NULL,
+    size NUMERIC NOT NULL,
+    notional NUMERIC NOT NULL,
+    order_id TEXT,
+    trade_id TEXT,
+    tx_index BIGINT NOT NULL,
+    realized_pnl NUMERIC,
+    liquidation BOOLEAN NOT NULL DEFAULT FALSE,
+    liquidation_mark_price NUMERIC,
+    liquidation_method TEXT,
+    PRIMARY KEY (id, ts)
+);
+SELECT create_hypertable(
+    'orderflow_events', by_range('ts'), if_not_exists => TRUE, migrate_data => TRUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS orderflow_events_dedupe_idx
+ON orderflow_events (
+    ts, tx_index, wallet, COALESCE(trade_id, ''), COALESCE(order_id, ''), side
+);
+CREATE INDEX IF NOT EXISTS orderflow_events_wallet_ts_idx
+ON orderflow_events (wallet, ts DESC);
+CREATE INDEX IF NOT EXISTS orderflow_events_symbol_ts_idx
+ON orderflow_events (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS orderflow_events_order_id_idx
+ON orderflow_events (order_id, ts DESC) WHERE order_id IS NOT NULL;
 
--- Labels are derived current state rather than event history. Schema changes to
--- this table use the explicit sql/reset_wallet_labels.sql operation; startup
--- schema initialization never truncates or migrates existing label rows.
-DO $$
-DECLARE
-    labels_table REGCLASS := to_regclass('wallet_flow_labels');
-BEGIN
-    IF labels_table IS NOT NULL
-       AND (
-           EXISTS (
-               SELECT 1
-               FROM unnest(ARRAY[
-                   'wallet', 'bucket_ts', 'trade_count', 'markout_sample_count',
-                   'markout_p10', 'markout_p20', 'markout_p30', 'markout_p40',
-                   'markout_p50', 'markout_p60', 'markout_p70', 'markout_p80',
-                   'markout_p90', 'realized_pnl', 'liquidation_ratio',
-                   'taker_ratio', 'cancel_to_fill_ratio',
-                   'message_cadence_per_min', 'holding_time_sec_median',
-                   'liquidity_provision_score', 'round_number_notional_ratio',
-                   'round_number_size_ratio', 'max_leverage',
-                   'cross_margin_ratio', 'updated_at'
-               ]) required(column_name)
-               WHERE NOT EXISTS (
-                   SELECT 1
-                   FROM pg_attribute
-                   WHERE attrelid = labels_table
-                     AND attname = required.column_name
-                     AND NOT attisdropped
-               )
-           )
-           OR EXISTS (
-               SELECT 1
-               FROM pg_attribute
-               WHERE attrelid = labels_table
-                 AND attname IN ('taker_markout', 'liquidation_count')
-                 AND NOT attisdropped
-           )
-           OR NOT EXISTS (
-               SELECT 1
-               FROM pg_constraint
-               WHERE conrelid = labels_table
-                 AND contype = 'p'
-                 AND conkey = ARRAY[
-                     (SELECT attnum
-                      FROM pg_attribute
-                      WHERE attrelid = labels_table
-                        AND attname = 'wallet'
-                        AND NOT attisdropped)
-                 ]::smallint[]
-           )
-       )
-    THEN
-        RAISE EXCEPTION
-            'wallet_flow_labels has an obsolete schema; run sql/reset_wallet_labels.sql before startup';
-    END IF;
-END $$;
+CREATE TABLE IF NOT EXISTS l2_event_counters (
+    symbol TEXT PRIMARY KEY,
+    last_event_no BIGINT NOT NULL
+);
+
+-- Current reconstruction state is durable so replay can continue across restarts.
+CREATE TABLE IF NOT EXISTS l2_book_state (
+    symbol TEXT PRIMARY KEY,
+    epoch TEXT NOT NULL,
+    source_seq BIGINT NOT NULL,
+    height BIGINT NOT NULL,
+    event_no BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS l2_book_levels (
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('bid', 'ask')),
+    price NUMERIC NOT NULL,
+    size NUMERIC NOT NULL,
+    order_count INTEGER NOT NULL,
+    PRIMARY KEY (symbol, side, price)
+);
+
+-- One row is persisted after each atomic per-coin l2BookDiff is applied.
+CREATE TABLE IF NOT EXISTS l2_book_ticks (
+    ts TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    height BIGINT NOT NULL,
+    epoch TEXT NOT NULL,
+    source_seq BIGINT NOT NULL,
+    event_no BIGINT NOT NULL,
+    best_bid NUMERIC NOT NULL,
+    best_ask NUMERIC NOT NULL,
+    mid_price NUMERIC NOT NULL,
+    spread_bps DOUBLE PRECISION NOT NULL,
+    bid_size NUMERIC NOT NULL,
+    ask_size NUMERIC NOT NULL,
+    imbalance DOUBLE PRECISION NOT NULL,
+    trailing_event_volatility DOUBLE PRECISION,
+    PRIMARY KEY (ts, symbol, event_no)
+);
+SELECT create_hypertable(
+    'l2_book_ticks', by_range('ts'), if_not_exists => TRUE, migrate_data => TRUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS l2_book_ticks_symbol_event_idx
+ON l2_book_ticks (symbol, event_no, ts);
+CREATE INDEX IF NOT EXISTS l2_book_ticks_symbol_ts_idx
+ON l2_book_ticks (symbol, ts DESC);
+
+-- Raw L4 lifecycle updates are short-lived; wallet aggregates below are durable.
+CREATE TABLE IF NOT EXISTS l4_order_events (
+    ts TIMESTAMPTZ NOT NULL,
+    height BIGINT NOT NULL,
+    event_index INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    wallet TEXT,
+    event_type TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price NUMERIC,
+    size NUMERIC,
+    resting_seconds DOUBLE PRECISION,
+    PRIMARY KEY (ts, height, event_index)
+);
+SELECT create_hypertable(
+    'l4_order_events', by_range('ts'), if_not_exists => TRUE, migrate_data => TRUE
+);
+CREATE INDEX IF NOT EXISTS l4_order_events_wallet_ts_idx
+ON l4_order_events (wallet, ts DESC) WHERE wallet IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS wallet_order_aggregates (
+    wallet TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    new_count BIGINT NOT NULL DEFAULT 0,
+    update_count BIGINT NOT NULL DEFAULT 0,
+    remove_count BIGINT NOT NULL DEFAULT 0,
+    round_size_count BIGINT NOT NULL DEFAULT 0,
+    total_resting_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    resting_sample_count BIGINT NOT NULL DEFAULT 0,
+    first_event_ts TIMESTAMPTZ NOT NULL,
+    last_event_ts TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (wallet, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS leverage_updates (
+    ts TIMESTAMPTZ NOT NULL,
+    wallet TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    update_type TEXT NOT NULL,
+    leverage DOUBLE PRECISION,
+    is_cross BOOLEAN,
+    is_buy BOOLEAN,
+    ntli NUMERIC,
+    tx_index BIGINT NOT NULL,
+    PRIMARY KEY (ts, wallet, symbol, tx_index, update_type)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_leverage_state (
+    wallet TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    current_leverage DOUBLE PRECISION,
+    max_leverage DOUBLE PRECISION,
+    update_count BIGINT NOT NULL DEFAULT 1,
+    cross_update_count BIGINT NOT NULL DEFAULT 0,
+    isolated_margin_update_count BIGINT NOT NULL DEFAULT 0,
+    first_update_ts TIMESTAMPTZ NOT NULL,
+    last_update_ts TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (wallet, symbol)
+);
+
+-- Matured samples survive the seven-day compact-book retention window.
+CREATE TABLE IF NOT EXISTS wallet_markout_samples (
+    fill_id BIGINT NOT NULL,
+    fill_ts TIMESTAMPTZ NOT NULL,
+    wallet TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    horizon_events INTEGER NOT NULL,
+    elapsed_seconds DOUBLE PRECISION NOT NULL,
+    raw_log_markout DOUBLE PRECISION NOT NULL,
+    normalized_markout DOUBLE PRECISION NOT NULL,
+    volatility_scale DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (fill_id, horizon_events)
+);
+CREATE INDEX IF NOT EXISTS wallet_markout_samples_wallet_horizon_idx
+ON wallet_markout_samples (wallet, horizon_events);
 
 CREATE TABLE IF NOT EXISTS wallet_flow_labels (
     wallet TEXT PRIMARY KEY,
     bucket_ts TIMESTAMPTZ NOT NULL,
-
-    trade_count BIGINT,
-    markout_sample_count BIGINT,
-    markout_p10 DOUBLE PRECISION,
-    markout_p20 DOUBLE PRECISION,
-    markout_p30 DOUBLE PRECISION,
-    markout_p40 DOUBLE PRECISION,
-    markout_p50 DOUBLE PRECISION,
-    markout_p60 DOUBLE PRECISION,
-    markout_p70 DOUBLE PRECISION,
-    markout_p80 DOUBLE PRECISION,
-    markout_p90 DOUBLE PRECISION,
-    realized_pnl DOUBLE PRECISION,
-    liquidation_ratio DOUBLE PRECISION,
+    trade_count BIGINT NOT NULL,
     taker_ratio DOUBLE PRECISION,
-    cancel_to_fill_ratio DOUBLE PRECISION,
-    message_cadence_per_min DOUBLE PRECISION,
-    holding_time_sec_median DOUBLE PRECISION,
-    liquidity_provision_score DOUBLE PRECISION,
+    liquidation_ratio DOUBLE PRECISION,
     round_number_notional_ratio DOUBLE PRECISION,
     round_number_size_ratio DOUBLE PRECISION,
+    message_cadence_per_min DOUBLE PRECISION,
+    realized_pnl DOUBLE PRECISION,
     max_leverage DOUBLE PRECISION,
-    cross_margin_ratio DOUBLE PRECISION,
-
+    current_max_leverage DOUBLE PRECISION,
+    leverage_update_count BIGINT NOT NULL DEFAULT 0,
+    isolated_margin_update_count BIGINT NOT NULL DEFAULT 0,
+    order_new_count BIGINT NOT NULL DEFAULT 0,
+    order_update_count BIGINT NOT NULL DEFAULT 0,
+    order_remove_count BIGINT NOT NULL DEFAULT 0,
+    order_remove_ratio DOUBLE PRECISION,
+    round_order_size_ratio DOUBLE PRECISION,
+    average_order_lifetime_seconds DOUBLE PRECISION,
+    markout_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

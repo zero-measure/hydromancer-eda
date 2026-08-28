@@ -8,6 +8,7 @@ import signal
 
 from hydromancer_eda.config import get_settings
 from hydromancer_eda.ingestion.allfills import AllFillsIngestionService
+from hydromancer_eda.ingestion.marketdata import MarketDataIngestionService
 
 
 async def _main() -> None:
@@ -16,7 +17,11 @@ async def _main() -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
-    await AllFillsIngestionService(get_settings()).run_forever(stop_event)
+    settings = get_settings()
+    await asyncio.gather(
+        AllFillsIngestionService(settings).run_forever(stop_event),
+        MarketDataIngestionService(settings).run_forever(stop_event),
+    )
 
 
 if __name__ == "__main__":

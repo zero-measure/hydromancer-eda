@@ -1,212 +1,67 @@
--- Live ingestion inspection queries for hydromancer-eda.
---
--- Run every query once from the repository root:
---   docker exec -i hydromancer-timescaledb \
---     psql --username postgres --dbname hydromancer \
---     < sql/inspect_live.sql
---
--- For interactive use, connect with psql, paste an individual query, and then
--- enter `\watch 2` to repeat it every two seconds. Press Ctrl-C to stop watching.
-
+\set ON_ERROR_STOP on
 \pset pager off
+\x auto
 \timing on
 
 \echo ''
-\echo '=== Tables ==='
-\dt
-
-\echo ''
-\echo '=== orderflow_events definition ==='
-\d orderflow_events
-
-\echo ''
-\echo '=== Overall ingestion progress ==='
+\echo '=== Safe ingestion health (no sessions or cursors) ==='
 SELECT
-    NOW() AS observed_at,
-    COUNT(*) AS total_rows,
-    MAX(ts) AS latest_event,
-    NOW() - MAX(ts) AS event_lag
-FROM orderflow_events;
+    channel,
+    updated_at
+FROM ingestion_checkpoints
+ORDER BY channel;
 
 \echo ''
-\echo '=== Latest normalized participant rows ==='
+\echo '=== Analytical row counts and freshness ==='
+SELECT
+    (SELECT COUNT(*) FROM orderflow_events) AS fills,
+    (SELECT MAX(ts) FROM orderflow_events) AS latest_fill,
+    (SELECT COUNT(*) FROM l2_book_ticks) AS compact_l2_ticks,
+    (SELECT MAX(ts) FROM l2_book_ticks) AS latest_l2_tick,
+    (SELECT COUNT(*) FROM l4_order_events) AS retained_l4_events,
+    (SELECT MAX(ts) FROM l4_order_events) AS latest_l4_event,
+    (SELECT COUNT(*) FROM leverage_updates) AS leverage_updates,
+    (SELECT MAX(ts) FROM leverage_updates) AS latest_leverage_update,
+    (SELECT COUNT(*) FROM wallet_flow_labels) AS labeled_wallets,
+    (SELECT MAX(bucket_ts) FROM wallet_flow_labels) AS latest_label_snapshot;
+
+\echo ''
+\echo '=== Latest participant fills ==='
 SELECT
     ts,
     symbol,
     wallet,
-    event_type,
     side,
     aggressor,
     price,
     size,
     notional,
-    trade_id,
-    order_id,
-    tx_index
+    realized_pnl,
+    liquidation,
+    liquidation_mark_price,
+    liquidation_method
 FROM orderflow_events
-ORDER BY ts DESC, tx_index DESC
+ORDER BY ts DESC, id DESC
 LIMIT 20;
 
 \echo ''
-\echo '=== Participant rows grouped by transaction identity ==='
-SELECT
-    ts,
-    tx_index,
-    trade_id,
+\echo '=== Compact L2 state by coin ==='
+SELECT DISTINCT ON (symbol)
     symbol,
-    COUNT(*) AS participant_rows,
-    COUNT(DISTINCT wallet) AS distinct_wallets,
-    ARRAY_AGG(wallet ORDER BY wallet) AS wallets
-FROM orderflow_events
-GROUP BY ts, tx_index, trade_id, symbol
-ORDER BY ts DESC, tx_index DESC
-LIMIT 20;
+    ts,
+    event_no,
+    best_bid,
+    best_ask,
+    mid_price,
+    spread_bps,
+    imbalance,
+    trailing_event_volatility
+FROM l2_book_ticks
+ORDER BY symbol, event_no DESC;
 
 \echo ''
-\echo '=== Durable WebSocket checkpoint ==='
-SELECT
-    channel,
-    session_id,
-    cursor,
-    updated_at,
-    NOW() - updated_at AS checkpoint_age
-FROM ingestion_checkpoints;
-
-\echo ''
-\echo '=== Latest quarantined malformed entries ==='
-SELECT
-    id,
-    channel,
-    cursor,
-    reason,
-    created_at,
-    raw
+\echo '=== Reject counts by channel ==='
+SELECT channel, COUNT(*) AS rejected_rows, MAX(created_at) AS latest_reject
 FROM ingestion_rejects
-ORDER BY created_at DESC
-LIMIT 20;
-
-\echo ''
-\echo '=== Reject count ==='
-SELECT COUNT(*) AS rejected_rows
-FROM ingestion_rejects;
-
-\echo ''
-\echo '=== Latest raw upstream payload ==='
-SELECT
-    ts,
-    wallet,
-    jsonb_pretty(raw) AS raw_payload
-FROM orderflow_events
-ORDER BY ts DESC, tx_index DESC
-LIMIT 1;
-
-\echo ''
-\echo '=== Ingestion volume by symbol over the last minute ==='
-SELECT
-    symbol,
-    COUNT(*) AS rows_last_minute,
-    MAX(ts) AS latest_event
-FROM orderflow_events
-WHERE ts >= NOW() - INTERVAL '1 minute'
-GROUP BY symbol
-ORDER BY symbol;
-
-\echo ''
-\echo '=== Wallet activity and latest labels over the last 24 hours ==='
-WITH activity_24h AS (
-    SELECT
-        wallet,
-        COUNT(*) AS event_count_24h,
-        COUNT(*) FILTER (
-            WHERE event_type IN ('trade', 'fill', 'liquidation')
-        ) AS trade_count_24h,
-        COUNT(*) FILTER (
-            WHERE aggressor = 'taker'
-              AND event_type IN ('trade', 'fill', 'liquidation')
-        ) AS taker_event_count_24h,
-        COUNT(*) FILTER (
-            WHERE liquidation
-              AND event_type IN ('trade', 'fill', 'liquidation')
-        ) AS liquidation_count_24h,
-        (COUNT(*) FILTER (
-            WHERE liquidation
-              AND event_type IN ('trade', 'fill', 'liquidation')
-        ))::float8
-            / NULLIF(COUNT(*) FILTER (
-                WHERE event_type IN ('trade', 'fill', 'liquidation')
-            ), 0) AS liquidation_ratio_24h,
-        MIN(ts) AS first_event_24h,
-        MAX(ts) AS latest_event_24h
-    FROM orderflow_events
-    WHERE ts >= NOW() - INTERVAL '24 hours'
-    GROUP BY wallet
-),
-selected_wallets AS (
-    (SELECT wallet, 'most liquidations'::text AS selection
-     FROM activity_24h
-     ORDER BY liquidation_count_24h DESC, event_count_24h DESC
-     LIMIT 10)
-    UNION
-    (SELECT wallet, 'most taker activity'::text AS selection
-     FROM activity_24h
-     ORDER BY taker_event_count_24h DESC, event_count_24h DESC
-     LIMIT 10)
-)
-SELECT
-    selected.selection,
-    labels.bucket_ts,
-    activity.wallet,
-    activity.event_count_24h,
-    activity.trade_count_24h,
-    activity.taker_event_count_24h,
-    activity.liquidation_count_24h,
-    activity.liquidation_ratio_24h,
-    activity.first_event_24h,
-    activity.latest_event_24h,
-    labels.trade_count AS lifetime_trade_count,
-    labels.markout_sample_count AS lifetime_markout_sample_count,
-    labels.markout_p10,
-    labels.markout_p20,
-    labels.markout_p30,
-    labels.markout_p40,
-    labels.markout_p50,
-    labels.markout_p60,
-    labels.markout_p70,
-    labels.markout_p80,
-    labels.markout_p90,
-    labels.realized_pnl,
-    labels.liquidation_ratio AS lifetime_liquidation_ratio,
-    labels.taker_ratio AS lifetime_taker_ratio,
-    labels.cancel_to_fill_ratio,
-    labels.message_cadence_per_min,
-    labels.holding_time_sec_median,
-    labels.liquidity_provision_score,
-    labels.round_number_notional_ratio,
-    labels.round_number_size_ratio,
-    labels.max_leverage,
-    labels.cross_margin_ratio
-FROM selected_wallets selected
-JOIN activity_24h activity USING (wallet)
-LEFT JOIN wallet_flow_labels labels USING (wallet)
-ORDER BY
-    selected.selection,
-    activity.liquidation_count_24h DESC,
-    activity.taker_event_count_24h DESC;
-
-\echo ''
-\echo '=== TimescaleDB hypertables ==='
-SELECT
-    hypertable_name,
-    num_dimensions,
-    num_chunks
-FROM timescaledb_information.hypertables
-ORDER BY hypertable_name;
-
-\echo ''
-\echo '=== Combined ingestion health ==='
-SELECT
-    (SELECT COUNT(*) FROM orderflow_events) AS events,
-    (SELECT MAX(ts) FROM orderflow_events) AS latest_event,
-    (SELECT COUNT(*) FROM ingestion_rejects) AS rejects,
-    (SELECT MAX(updated_at) FROM ingestion_checkpoints) AS latest_checkpoint,
-    (SELECT MAX(bucket_ts) FROM wallet_flow_labels) AS latest_label_snapshot;
+GROUP BY channel
+ORDER BY channel;
