@@ -25,6 +25,13 @@ dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.23.8",
 ]
+notebooks = [
+  "anywidget>=0.9.18",
+  "ipykernel>=6.29.0",
+  "jupyterlab>=4.2.0",
+  "nbconvert>=7.16.0",
+  "plotly>=6.0.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

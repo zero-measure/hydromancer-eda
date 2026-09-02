@@ -72,8 +72,8 @@ def test_documented_positional_l2_snapshot_bootstraps_book(monkeypatch) -> None:
         4,
     ]
     snapshot[2] = [
-        [{"px": "99", "sz": "5", "n": 1}],
-        [{"px": "101", "sz": "3", "n": 1}],
+        [["99", "5", 1]],
+        [["101", "3", 1]],
     ]
     monkeypatch.setattr(
         marketdata, "_post_snapshot", lambda *_args: msgpack.packb(snapshot)

@@ -97,6 +97,20 @@ pip install -e '.[dev]'
 cp .env.example .env
 ```
 
+For the Jupyter debugging environment, install and register the project kernel:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[notebooks]'
+python -m ipykernel install --user \
+  --name hydromancer-eda \
+  --display-name 'Hydromancer EDA (.venv)'
+jupyter lab notebooks/debug_hydromancer_snapshot_403.ipynb
+```
+
+The notebook is configured to select `Hydromancer EDA (.venv)` automatically.
+
 Set at least:
 
 ```dotenv

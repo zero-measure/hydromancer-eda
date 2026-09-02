@@ -522,7 +522,8 @@ class PostgresStore:
             total_resting_seconds,resting_sample_count,first_event_ts,last_event_ts
         ) VALUES (
             $1,$2,($3='new')::int,($3='update')::int,($3='remove')::int,
-            ($3='new' AND $4 IS NOT NULL AND MOD(ABS($4),0.1::numeric)=0)::int,
+            ($3='new' AND $4::numeric IS NOT NULL
+                AND MOD(ABS($4::numeric),0.1::numeric)=0)::int,
             COALESCE($5,0),($5 IS NOT NULL)::int,$6,$6
         )
         ON CONFLICT (wallet,symbol) DO UPDATE SET

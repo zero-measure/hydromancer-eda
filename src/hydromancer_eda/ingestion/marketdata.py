@@ -48,7 +48,11 @@ def _post_snapshot(token: str, payload: dict[str, Any]) -> bytes:
     request = urllib.request.Request(
         "https://api.hydromancer.xyz/info",
         data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "hydromancer-eda/0.1",
+        },
         method="POST",
     )
     try:
@@ -166,9 +170,17 @@ class L2BookHandler:
             )
             for side_index, side in enumerate((state.bids, state.asks)):
                 for level in levels[side_index]:
-                    side[Decimal(str(level["px"]))] = (
-                        Decimal(str(level["sz"])),
-                        int(level["n"]),
+                    if isinstance(level, dict):
+                        price_value, size_value, order_count = (
+                            level["px"],
+                            level["sz"],
+                            level["n"],
+                        )
+                    else:
+                        price_value, size_value, order_count = level
+                    side[Decimal(str(price_value))] = (
+                        Decimal(str(size_value)),
+                        int(order_count),
                     )
             if state.bids and state.asks:
                 snapshot_mid = float((max(state.bids) + min(state.asks)) / 2)
@@ -324,7 +336,8 @@ class L4BookHandler:
             offset += 4
             blob = raw[offset : offset + blob_length]
             offset += blob_length
-            decoded = msgpack.unpackb(decompressor.decompress(blob), raw=False)
+            with decompressor.stream_reader(blob) as reader:
+                decoded = msgpack.unpackb(reader.read(), raw=False)
             coin = str(decoded[0])
             for side_name, orders in (("buy", decoded[1]), ("sell", decoded[2])):
                 for user, price, size, order_id in orders:
@@ -604,8 +617,12 @@ class ChannelRunner:
                 struct.error,
                 zstandard.ZstdError,
                 msgpack.UnpackException,
-            ):
-                logger.warning("%s connection or payload failed; retrying", self.handler.channel)
+            ) as exc:
+                logger.warning(
+                    "%s connection or payload failed (%s); retrying",
+                    self.handler.channel,
+                    type(exc).__name__,
+                )
                 await self.handler.reset_after_failure()
                 attempt += 1
                 await self._backoff(stop_event, attempt)
