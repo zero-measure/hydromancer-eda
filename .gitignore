@@ -8,8 +8,9 @@
 # macOS
 .DS_Store
 
-# Python
+# Python and Jupyter
 __pycache__/
+.ipynb_checkpoints/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
