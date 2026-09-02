@@ -44,6 +44,47 @@ def _timestamp(value: float) -> datetime:
     return datetime.fromtimestamp(float(value) / 1000, tz=UTC)
 
 
+def decode_l2_snapshots(payload: bytes) -> list[list[Any]]:
+    """Decode single-msgpack or length-prefixed multi-zstd L2 snapshots."""
+    if len(payload) >= 12 and payload[8:12] == b"\x28\xb5\x2f\xfd":
+        count = struct.unpack_from("<I", payload)[0]
+        offset = 4
+        snapshots: list[Any] = []
+        decompressor = zstandard.ZstdDecompressor()
+        for _ in range(count):
+            if offset + 4 > len(payload):
+                raise ValueError("Truncated L2 snapshot blob-length field")
+            blob_length = struct.unpack_from("<I", payload, offset)[0]
+            offset += 4
+            blob = payload[offset : offset + blob_length]
+            if len(blob) != blob_length:
+                raise ValueError("Truncated L2 snapshot compressed blob")
+            offset += blob_length
+            with decompressor.stream_reader(blob) as reader:
+                snapshots.append(msgpack.unpackb(reader.read(), raw=False))
+        if offset != len(payload):
+            raise ValueError("Unexpected trailing bytes in L2 snapshot response")
+    else:
+        unpacker = msgpack.Unpacker(raw=False)
+        unpacker.feed(payload)
+        objects = list(unpacker)
+        if not objects or unpacker.tell() != len(payload):
+            raise ValueError("Empty or truncated L2 snapshot response")
+        if len(objects) > 1:
+            snapshots = objects
+        else:
+            decoded = objects[0]
+            snapshots = [decoded] if decoded and isinstance(decoded[0], str) else decoded
+    if not all(
+        isinstance(snapshot, list)
+        and len(snapshot) == 6
+        and isinstance(snapshot[0], str)
+        for snapshot in snapshots
+    ):
+        raise ValueError("Unexpected L2 snapshot response shape")
+    return cast(list[list[Any]], snapshots)
+
+
 def _post_snapshot(token: str, payload: dict[str, Any]) -> bytes:
     request = urllib.request.Request(
         "https://api.hydromancer.xyz/info",
@@ -153,9 +194,7 @@ class L2BookHandler:
             self.settings.hydromancer_api_key,
             {"type": "l2BookDiffSnapshot", "coins": coins},
         )
-        decoded = msgpack.unpackb(raw, raw=False)
-        snapshots = [decoded] if decoded and isinstance(decoded[0], str) else decoded
-        for snapshot in snapshots:
+        for snapshot in decode_l2_snapshots(raw):
             coin, _time_ms, levels, _height, epoch, source_seq = snapshot
             event_no = await self.store.next_l2_event_number(str(coin))
             mids = await self.store.recent_l2_mids(

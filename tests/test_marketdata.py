@@ -15,6 +15,7 @@ from hydromancer_eda.ingestion.marketdata import (
     L4BookHandler,
     LeverageHandler,
     RestingOrder,
+    decode_l2_snapshots,
 )
 
 
@@ -87,6 +88,33 @@ def test_documented_positional_l2_snapshot_bootstraps_book(monkeypatch) -> None:
     assert handler.states["COIN"].height == 6
     assert handler.states["COIN"].event_no == 0
     assert store.snapshot_args is not None
+
+
+def test_concatenated_multi_coin_l2_snapshots_decode() -> None:
+    first = ["COIN", 1, [[], []], 10, "epoch", 2]
+    second = ["OTHER", 1, [[], []], 10, "epoch", 3]
+
+    decoded = decode_l2_snapshots(msgpack.packb(first) + msgpack.packb(second))
+
+    assert [snapshot[0] for snapshot in decoded] == ["COIN", "OTHER"]
+
+
+def test_length_prefixed_multi_zstd_l2_snapshots_decode() -> None:
+    snapshots = [
+        ["COIN", 1, [[], []], 10, "epoch", 2],
+        ["OTHER", 1, [[], []], 10, "epoch", 3],
+    ]
+    blobs = [
+        zstandard.ZstdCompressor(write_content_size=False).compress(msgpack.packb(item))
+        for item in snapshots
+    ]
+    payload = struct.pack("<I", len(blobs)) + b"".join(
+        struct.pack("<I", len(blob)) + blob for blob in blobs
+    )
+
+    decoded = decode_l2_snapshots(payload)
+
+    assert [snapshot[0] for snapshot in decoded] == ["COIN", "OTHER"]
 
 
 def test_l2_counts_one_event_per_coin_diff_and_builds_compact_tick() -> None:
