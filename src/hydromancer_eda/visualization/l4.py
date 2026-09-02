@@ -124,14 +124,12 @@ def _visible_levels(
     return [*bids, *asks]
 
 
-def _build_figure(
+def _frame_data(
     snapshot: L4Snapshot,
     coin: str | None,
     level_count: int,
     minimum_named_share: float,
-) -> Any:
-    import plotly.graph_objects as go
-
+) -> tuple[str, list[dict[str, Any]], set[str]]:
     market = _market(snapshot, coin)
     selected_coin = str(market["coin"])
     levels = _visible_levels(market, level_count)
@@ -163,77 +161,135 @@ def _build_figure(
                 "shares": shares,
             }
         )
+    return selected_coin, rows, wallets
+
+
+def _wallet_trace_values(
+    wallet: str, rows: list[dict[str, Any]]
+) -> tuple[list[float], list[str], list[str], list[str]]:
+    x: list[float] = []
+    hover: list[str] = []
+    text: list[str] = []
+    labels: list[str] = []
+    for row in rows:
+        share = row["shares"].get(wallet, 0.0)
+        x.append(-share if row["side"] == "bid" else share)
+        labels.append(row["label"])
+        short_wallet = wallet if wallet == "Other" else f"{wallet[:8]}…{wallet[-4:]}"
+        hover.append(
+            f"wallet={wallet}<br>side={row['side']}<br>price={row['price']}"
+            f"<br>level size={row['total']}<br>share={share:.3f}%"
+        )
+        text.append(f"{short_wallet} {share:.1f}%" if share >= 5 else "")
+    return x, labels, hover, text
+
+
+def _update_figure_in_place(
+    figure: Any,
+    snapshot: L4Snapshot,
+    coin: str | None,
+    level_count: int,
+    minimum_named_share: float,
+) -> None:
+    """Mutate one FigureWidget; never emit or replace its notebook output."""
+    selected_coin, rows, wallets = _frame_data(
+        snapshot, coin, level_count, minimum_named_share
+    )
+    existing = {str(trace.meta): trace for trace in figure.data}
+    labels = [row["label"] for row in rows]
+
+    with figure.batch_update():
+        for wallet, trace in existing.items():
+            if wallet not in wallets:
+                trace.visible = False
+                continue
+            x, y, hover, text = _wallet_trace_values(wallet, rows)
+            trace.update(
+                x=x,
+                y=y,
+                customdata=hover,
+                text=text,
+                visible=True,
+            )
+        for wallet in sorted(wallets - existing.keys(), key=lambda value: (value == "Other", value)):
+            x, y, hover, text = _wallet_trace_values(wallet, rows)
+            figure.add_bar(
+                meta=wallet,
+                name=wallet if wallet == "Other" else f"{wallet[:8]}…{wallet[-4:]}",
+                y=y,
+                x=x,
+                orientation="h",
+                marker_color=_wallet_color(wallet),
+                customdata=hover,
+                hovertemplate="%{customdata}<extra></extra>",
+                text=text,
+                textposition="inside",
+            )
+        figure.update_layout(
+            title=(
+                f"{selected_coin} L4 wallet ownership — block "
+                f"{snapshot.get('height', '?')}"
+            ),
+            barmode="relative",
+            xaxis={
+                "title": "Wallet share of price level (bid ← % → ask)",
+                "range": [-100, 100],
+                "ticksuffix": "%",
+                "zeroline": True,
+                "zerolinewidth": 2,
+            },
+            yaxis={
+                "categoryorder": "array",
+                "categoryarray": list(reversed(labels)),
+            },
+            legend={"title": "Wallet", "tracegroupgap": 0},
+            height=max(500, 34 * len(rows) + 170),
+            margin={"l": 120, "r": 30, "t": 70, "b": 60},
+            transition={"duration": 120, "easing": "cubic-in-out"},
+            template="plotly_white",
+        )
+
+
+def _build_figure(
+    snapshot: L4Snapshot,
+    coin: str | None,
+    level_count: int,
+    minimum_named_share: float,
+) -> Any:
+    """Build a static figure, primarily for export and deterministic tests."""
+    import plotly.graph_objects as go
 
     figure = go.Figure()
-    labels = [row["label"] for row in rows]
-    for wallet in sorted(wallets, key=lambda value: (value == "Other", value)):
-        x: list[float] = []
-        hover: list[str] = []
-        text: list[str] = []
-        for row in rows:
-            share = row["shares"].get(wallet, 0.0)
-            signed_share = -share if row["side"] == "bid" else share
-            x.append(signed_share)
-            short_wallet = wallet if wallet == "Other" else f"{wallet[:8]}…{wallet[-4:]}"
-            hover.append(
-                f"wallet={wallet}<br>side={row['side']}<br>price={row['price']}"
-                f"<br>level size={row['total']}<br>share={share:.3f}%"
-            )
-            text.append(f"{short_wallet} {share:.1f}%" if share >= 5 else "")
-        figure.add_bar(
-            name=wallet if wallet == "Other" else f"{wallet[:8]}…{wallet[-4:]}",
-            y=labels,
-            x=x,
-            orientation="h",
-            marker_color=_wallet_color(wallet),
-            customdata=hover,
-            hovertemplate="%{customdata}<extra></extra>",
-            text=text,
-            textposition="inside",
-        )
-    figure.update_layout(
-        title=(
-            f"{selected_coin} L4 wallet ownership — block {snapshot.get('height', '?')}"
-        ),
-        barmode="relative",
-        xaxis={
-            "title": "Wallet share of price level (bid ← % → ask)",
-            "range": [-100, 100],
-            "ticksuffix": "%",
-            "zeroline": True,
-            "zerolinewidth": 2,
-        },
-        yaxis={"categoryorder": "array", "categoryarray": list(reversed(labels))},
-        legend={"title": "Wallet", "tracegroupgap": 0},
-        height=max(500, 34 * len(rows) + 170),
-        margin={"l": 120, "r": 30, "t": 70, "b": 60},
-        transition={"duration": 120, "easing": "cubic-in-out"},
-        template="plotly_white",
+    _update_figure_in_place(
+        figure, snapshot, coin, level_count, minimum_named_share
     )
     return figure
 
 
 @dataclass
 class L4BookAnimator:
-    """Own a notebook display handle that can be refreshed with new snapshots."""
+    """Update one persistent notebook FigureWidget as L4 state changes."""
 
     snapshot: L4Snapshot
     coin: str | None
     level_count: int
     minimum_named_share: float
-    display_handle: Any
+    figure: Any
     last_render_time: float = 0.0
 
     def update(self, snapshot: L4Snapshot, max_fps: float = 5.0) -> bool:
-        """Replace the chart, coalescing renders while preserving every book update."""
+        """Mutate the existing widget, coalescing renders but not book updates."""
         self.snapshot = snapshot
         now = time.monotonic()
         if max_fps > 0 and now - self.last_render_time < 1 / max_fps:
             return False
-        figure = _build_figure(
-            snapshot, self.coin, self.level_count, self.minimum_named_share
+        _update_figure_in_place(
+            self.figure,
+            snapshot,
+            self.coin,
+            self.level_count,
+            self.minimum_named_share,
         )
-        self.display_handle.update(figure)
         self.last_render_time = now
         return True
 
@@ -244,24 +300,27 @@ def animate_l4_book(
     level_count: int = 12,
     minimum_named_share: float = 0.0,
 ) -> L4BookAnimator:
-    """Display an animated bid/ask chart and return its incremental updater."""
+    """Display one FigureWidget and return its in-place incremental updater."""
+    import plotly.graph_objects as go
     from IPython.display import display
 
     if level_count < 1:
         raise ValueError("level_count must be positive")
     if not 0 <= minimum_named_share <= 100:
         raise ValueError("minimum_named_share must be between 0 and 100")
-    figure = _build_figure(snapshot, coin, level_count, minimum_named_share)
-    handle = display(figure, display_id=True)
+    figure = go.FigureWidget()
+    _update_figure_in_place(
+        figure, snapshot, coin, level_count, minimum_named_share
+    )
+    display(figure)
     return L4BookAnimator(
         snapshot=snapshot,
         coin=coin,
         level_count=level_count,
         minimum_named_share=minimum_named_share,
-        display_handle=handle,
+        figure=figure,
         last_render_time=time.monotonic(),
     )
-
 
 class L4BookState:
     """Apply l4BookUpdates diffs to a full snapshot used by the animator."""
