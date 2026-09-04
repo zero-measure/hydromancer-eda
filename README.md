@@ -159,6 +159,34 @@ docker exec -i hydromancer-timescaledb \
   < sql/inspect_labels.sql
 ```
 
+## Run ad hoc database queries
+
+Run the editable multiline query in `query_db.sh`:
+
+```bash
+./query_db.sh
+```
+
+Edit the SQL block near the bottom of that script to change the query without
+having to quote SQL on the command line. The script checks that the TimescaleDB
+container is running and connects to the `hydromancer` database as `postgres`.
+
+It can also execute a separate SQL file:
+
+```bash
+./query_db.sh sql/inspect_live.sql
+./query_db.sh sql/inspect_labels.sql
+```
+
+The container, database, and user can be overridden when needed:
+
+```bash
+CONTAINER=hydromancer-timescaledb \
+DATABASE=hydromancer \
+DB_USER=postgres \
+./query_db.sh
+```
+
 ## Verification
 
 ```bash
