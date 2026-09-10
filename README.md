@@ -7,10 +7,10 @@ diffs, L4 order lifecycle updates, and market-wide leverage changes.
 
 The service runs four independently checkpointed WebSocket consumers:
 
-- `allFills`: participant executions used for wallet outcomes and trade behavior.
-- `l2BookDiff`: one atomic per-coin book event per changed block.
-- `l4BookUpdates`: wallet-attributed order lifecycle behavior.
-- `allLeverageUpdates`: leverage settings plus isolated-margin and top-up changes.
+- `allFills`: stream all fills. Each fill contains an address and fill details. Fills are batched per block.
+- `l2BookDiff`: all changed levels for your subscribed coins in a single block. A message is sent only for blocks that change something you're subscribed to — quiet blocks are skipped.
+- `l4BookUpdates`: updates streamed per-block with order changes for subscribed markets.
+- `allLeverageUpdates`: updates to leverage settings plus isolated-margin and top-up changes.
 
 Every connection responds to application `ping` messages with `pong`. Session IDs
 and opaque cursors are stored only in `ingestion_checkpoints`; token-bearing
