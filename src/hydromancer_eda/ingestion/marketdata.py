@@ -25,11 +25,16 @@ from websockets.exceptions import WebSocketException
 
 from hydromancer_eda.client.ws import HydromancerWebSocket
 from hydromancer_eda.config import Settings
+from hydromancer_eda.ingestion.progress import ReplayProgress
 from hydromancer_eda.models import L2BookTick, L4OrderEvent, LeverageUpdate, Side
 from hydromancer_eda.storage.postgres import PostgresStore
 
 logger = logging.getLogger(__name__)
 REPLAY_GRACE_SECONDS = 10.0
+
+
+class ReplayStalledError(Exception):
+    """A channel replay made no progress before its configured timeout."""
 
 
 class SnapshotRequestError(OSError):
@@ -188,58 +193,112 @@ class L2BookHandler:
         self.states[coin] = state
         return True
 
+    async def _report_bootstrap_status(
+        self, coins: list[str], started_at: float
+    ) -> None:
+        """Report that an L2 snapshot request is still in progress."""
+        while True:
+            await asyncio.sleep(self.settings.replay_status_interval_seconds)
+            logger.info(
+                "l2 re-bootstrap still waiting for snapshot for %s (%.1fs elapsed)",
+                ", ".join(coins),
+                time.monotonic() - started_at,
+            )
+
     async def _bootstrap(self, coins: list[str]) -> None:
-        raw = await asyncio.to_thread(
-            _post_snapshot,
-            self.settings.hydromancer_api_key,
-            {"type": "l2BookDiffSnapshot", "coins": coins},
-        )
-        for snapshot in decode_l2_snapshots(raw):
-            coin, _time_ms, levels, _height, epoch, source_seq = snapshot
-            event_no = await self.store.next_l2_event_number(str(coin))
-            mids = await self.store.recent_l2_mids(
-                str(coin), self.settings.l2_volatility_lookback + 1
+        started_at = time.monotonic()
+        logger.info("l2 re-bootstrap started for %s", ", ".join(coins))
+        reporter = asyncio.create_task(self._report_bootstrap_status(coins, started_at))
+        installed: set[str] = set()
+        try:
+            raw = await asyncio.to_thread(
+                _post_snapshot,
+                self.settings.hydromancer_api_key,
+                {"type": "l2BookDiffSnapshot", "coins": coins},
             )
-            state = BookState(
-                epoch=str(epoch),
-                source_seq=int(source_seq),
-                height=int(_height),
-                event_no=event_no - 1,
-                mids=deque(mids, maxlen=self.settings.l2_volatility_lookback + 1),
+            snapshots = decode_l2_snapshots(raw)
+            logger.info(
+                "l2 snapshot response received for %s after %.1fs; decoded %d snapshot(s)",
+                ", ".join(coins),
+                time.monotonic() - started_at,
+                len(snapshots),
             )
-            for side_index, side in enumerate((state.bids, state.asks)):
-                for level in levels[side_index]:
-                    if isinstance(level, dict):
-                        price_value, size_value, order_count = (
-                            level["px"],
-                            level["sz"],
-                            level["n"],
+            for snapshot in snapshots:
+                coin, _time_ms, levels, _height, epoch, source_seq = snapshot
+                coin_name = str(coin)
+                event_no = await self.store.next_l2_event_number(coin_name)
+                mids = await self.store.recent_l2_mids(
+                    coin_name, self.settings.l2_volatility_lookback + 1
+                )
+                state = BookState(
+                    epoch=str(epoch),
+                    source_seq=int(source_seq),
+                    height=int(_height),
+                    event_no=event_no - 1,
+                    mids=deque(mids, maxlen=self.settings.l2_volatility_lookback + 1),
+                )
+                for side_index, side in enumerate((state.bids, state.asks)):
+                    for level in levels[side_index]:
+                        if isinstance(level, dict):
+                            price_value, size_value, order_count = (
+                                level["px"],
+                                level["sz"],
+                                level["n"],
+                            )
+                        else:
+                            price_value, size_value, order_count = level
+                        side[Decimal(str(price_value))] = (
+                            Decimal(str(size_value)),
+                            int(order_count),
                         )
-                    else:
-                        price_value, size_value, order_count = level
-                    side[Decimal(str(price_value))] = (
-                        Decimal(str(size_value)),
-                        int(order_count),
-                    )
-            if state.bids and state.asks:
-                snapshot_mid = float((max(state.bids) + min(state.asks)) / 2)
-                if not state.mids or state.mids[-1] != snapshot_mid:
-                    state.mids.append(snapshot_mid)
-            self.states[str(coin)] = state
-            durable_levels = [
-                (side_name, price, size, order_count)
-                for side_name, side in (("bid", state.bids), ("ask", state.asks))
-                for price, (size, order_count) in side.items()
-            ]
-            await self.store.replace_l2_book_state(
-                str(coin),
-                state.epoch,
-                state.source_seq,
-                state.height,
-                state.event_no,
-                _timestamp(float(_time_ms)),
-                durable_levels,
+                if state.bids and state.asks:
+                    snapshot_mid = float((max(state.bids) + min(state.asks)) / 2)
+                    if not state.mids or state.mids[-1] != snapshot_mid:
+                        state.mids.append(snapshot_mid)
+                self.states[coin_name] = state
+                durable_levels = [
+                    (side_name, price, size, order_count)
+                    for side_name, side in (("bid", state.bids), ("ask", state.asks))
+                    for price, (size, order_count) in side.items()
+                ]
+                await self.store.replace_l2_book_state(
+                    coin_name,
+                    state.epoch,
+                    state.source_seq,
+                    state.height,
+                    state.event_no,
+                    _timestamp(float(_time_ms)),
+                    durable_levels,
+                )
+                installed.add(coin_name)
+                logger.info(
+                    "l2 snapshot installed for %s at height %d, source sequence %d",
+                    coin_name,
+                    state.height,
+                    state.source_seq,
+                )
+            missing = set(coins) - installed
+            if missing:
+                raise ValueError(
+                    "l2 snapshot response omitted requested coin(s): "
+                    + ", ".join(sorted(missing))
+                )
+            logger.info(
+                "l2 re-bootstrap snapshot phase succeeded for %s in %.1fs",
+                ", ".join(coins),
+                time.monotonic() - started_at,
             )
+        except Exception as exc:
+            logger.error(
+                "l2 re-bootstrap failed for %s after %.1fs (%s); channel will reconnect",
+                ", ".join(coins),
+                time.monotonic() - started_at,
+                type(exc).__name__,
+            )
+            raise
+        finally:
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
 
     async def reset_after_failure(self) -> None:
         """Discard uncommitted in-memory changes and restore from PostgreSQL."""
@@ -280,9 +339,29 @@ class L2BookHandler:
                 await self._bootstrap([coin])
                 state = self.states[coin]
                 if height <= state.height:
+                    logger.info(
+                        "l2 continuity restored for %s: snapshot height %d already covers "
+                        "incoming height %d",
+                        coin,
+                        state.height,
+                        height,
+                    )
                     continue
                 if epoch != state.epoch or int(diff["prev_seq"]) != state.source_seq:
+                    logger.error(
+                        "l2 re-bootstrap did not align for %s: snapshot sequence %d, "
+                        "incoming previous sequence %d; reconnecting",
+                        coin,
+                        state.source_seq,
+                        int(diff["prev_seq"]),
+                    )
                     raise ValueError(f"l2 snapshot did not align for {coin}")
+                logger.info(
+                    "l2 continuity restored for %s at height %d, source sequence %d",
+                    coin,
+                    state.height,
+                    state.source_seq,
+                )
             for side_index, side in enumerate((state.bids, state.asks)):
                 side_name = "bid" if side_index == 0 else "ask"
                 for level in diff["levels"][side_index]:
@@ -541,6 +620,12 @@ class ChannelRunner:
         self.replay_pending = False
         self.replay_deadline = 0.0
         self.buffered_live: list[dict[str, Any]] = []
+        self.progress = ReplayProgress(
+            handler.channel,
+            logger,
+            settings.replay_status_interval_seconds,
+            settings.replay_stall_timeout_seconds,
+        )
 
     async def _process_live(self, message: dict[str, Any]) -> None:
         seq = message.get("seq")
@@ -559,15 +644,34 @@ class ChannelRunner:
         for message in buffered:
             await self._process_live(message)
 
+    async def _finish_no_replay(self) -> None:
+        """Declare recovery current when the server sends no replay within grace."""
+        if not self.replay_pending or not self.progress.active:
+            return
+        logger.info(
+            "%s sent no replay within %.1fs; cursor is current",
+            self.handler.channel,
+            REPLAY_GRACE_SECONDS,
+        )
+        self.replay_pending = False
+        buffered_count = len(self.buffered_live)
+        self.progress.finish(buffered_count, "no replay required")
+        await self._flush_live()
+
     async def _backoff(self, stop_event: asyncio.Event, attempt: int) -> None:
-        delay = min(
+        maximum = min(
             30.0,
             self.settings.reconnect_delay_seconds * (2 ** min(attempt, 5)),
         )
+        delay = maximum + random.uniform(0, maximum * 0.2)
+        logger.warning(
+            "%s reconnect attempt %d starts in %.1fs from the durable cursor",
+            self.handler.channel,
+            attempt,
+            delay,
+        )
         try:
-            await asyncio.wait_for(
-                stop_event.wait(), timeout=delay + random.uniform(0, delay * 0.2)
-            )
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
         except TimeoutError:
             pass
 
@@ -581,63 +685,150 @@ class ChannelRunner:
                 connection = await websocket.connect(self.session_id, self.cursor)
                 async with connection:
                     attempt = 0
-                    async for message in websocket.messages(connection):
-                        message_type = message.get("type")
-                        if message_type == "ping":
-                            await websocket.send(connection, {"type": "pong"})
-                            continue
-                        if message_type in {"connected", "reconnected"}:
-                            new_session = message.get("sessionId")
-                            if isinstance(new_session, str):
-                                self.session_id = new_session
-                            self.last_seq = 0
-                            self.buffered_live.clear()
-                            self.replay_pending = message_type == "reconnected"
-                            self.replay_deadline = time.monotonic() + REPLAY_GRACE_SECONDS
-                            if message_type == "connected":
-                                await websocket.send(
-                                    connection,
-                                    {
-                                        "method": "subscribe",
-                                        "subscription": self.handler.subscription,
-                                    },
+                    monitor = asyncio.create_task(
+                        self.progress.monitor(
+                            connection,
+                            stop_event,
+                            lambda: len(self.buffered_live),
+                            REPLAY_GRACE_SECONDS,
+                            self._finish_no_replay,
+                        )
+                    )
+                    try:
+                        async for message in websocket.messages(connection):
+                            message_type = message.get("type")
+                            if message_type == "ping":
+                                await websocket.send(connection, {"type": "pong"})
+                                continue
+                            if message_type in {"connected", "reconnected"}:
+                                new_session = message.get("sessionId")
+                                if isinstance(new_session, str):
+                                    self.session_id = new_session
+                                self.last_seq = 0
+                                self.buffered_live.clear()
+                                self.replay_pending = (
+                                    message_type == "reconnected" or self.cursor is not None
                                 )
-                            await self.handler.ensure_ready()
-                            await self.store.persist_channel_cursor(
-                                self.handler.channel, self.session_id, self.cursor
-                            )
-                            continue
-                        if (
-                            self.replay_pending
-                            and time.monotonic() >= self.replay_deadline
-                            and message_type != "replay"
-                        ):
-                            self.replay_pending = False
-                            await self._flush_live()
-                        if message_type == "replay" and message.get("channel") == self.handler.channel:
-                            self.replay_deadline = math.inf
-                            if message.get("hasGap"): 
-                                logger.warning("%s replay reported a gap", self.handler.channel)
-                            for item in message.get("data", []):
-                                await self.handler.process(item, None, self.session_id)
-                            cursor_value = message.get("cursor")
-                            if cursor_value is not None:
-                                self.cursor = str(cursor_value)
+                                self.replay_deadline = time.monotonic() + REPLAY_GRACE_SECONDS
+                                if message_type == "connected":
+                                    subscription = dict(self.handler.subscription)
+                                    if self.cursor is not None:
+                                        subscription["cursor"] = self.cursor
+                                        logger.warning(
+                                            "%s session expired; starting cursor-based backfill",
+                                            self.handler.channel,
+                                        )
+                                    await websocket.send(
+                                        connection,
+                                        {"method": "subscribe", "subscription": subscription},
+                                    )
+                                await self.handler.ensure_ready()
                                 await self.store.persist_channel_cursor(
                                     self.handler.channel, self.session_id, self.cursor
                                 )
-                            if int(message.get("chunk", 1)) == int(message.get("totalChunks", 1)):
-                                self.replay_pending = False
-                                await self._flush_live()
-                            continue
-                        if message_type == self.handler.channel:
-                            if self.replay_pending:
-                                self.buffered_live.append(message)
-                            else:
-                                await self._process_live(message)
-                        if stop_event.is_set():
-                            break
+                                if self.replay_pending:
+                                    reason = (
+                                        "existing session resumed"
+                                        if message_type == "reconnected"
+                                        else "new session resumed from durable cursor"
+                                    )
+                                    self.progress.start(reason)
+                                else:
+                                    logger.info(
+                                        "%s connected with no prior cursor; live ingestion is ready",
+                                        self.handler.channel,
+                                    )
+                                continue
+                            if message_type == "subscriptionUpdate":
+                                failed = message.get("failed")
+                                if isinstance(failed, list) and failed:
+                                    logger.error(
+                                        "%s subscription rejected: %s",
+                                        self.handler.channel,
+                                        failed,
+                                    )
+                                    raise ValueError("subscription rejected")
+                            if message_type == "error":
+                                logger.error(
+                                    "%s WebSocket protocol error; reconnecting",
+                                    self.handler.channel,
+                                )
+                                raise ValueError("WebSocket protocol error")
+                            if (
+                                self.replay_pending
+                                and time.monotonic() >= self.replay_deadline
+                                and message_type != "replay"
+                            ):
+                                await self._finish_no_replay()
+                            if (
+                                message_type == "replay"
+                                and message.get("channel") == self.handler.channel
+                            ):
+                                self.replay_deadline = math.inf
+                                data = message.get("data", [])
+                                chunk = message.get("chunk", 1)
+                                total = message.get("totalChunks", 1)
+                                if not isinstance(data, list):
+                                    raise TypeError("replay data is not a list")
+                                if (
+                                    not isinstance(chunk, int)
+                                    or isinstance(chunk, bool)
+                                    or not isinstance(total, int)
+                                    or isinstance(total, bool)
+                                    or chunk < 1
+                                    or total < chunk
+                                ):
+                                    raise ValueError("invalid replay chunk metadata")
+                                has_gap = message.get("hasGap") is True
+                                if has_gap:
+                                    logger.error(
+                                        "%s replay reported a data gap; available replay will "
+                                        "continue but market-wide REST repair is unavailable",
+                                        self.handler.channel,
+                                    )
+                                for item in data:
+                                    await self.handler.process(item, None, self.session_id)
+                                cursor_value = message.get("cursor")
+                                if cursor_value is not None:
+                                    self.cursor = str(cursor_value)
+                                    await self.store.persist_channel_cursor(
+                                        self.handler.channel, self.session_id, self.cursor
+                                    )
+                                self.progress.advance(
+                                    chunk,
+                                    total,
+                                    len(data),
+                                    has_gap,
+                                    len(self.buffered_live),
+                                )
+                                has_more = message.get("hasMore")
+                                terminal = has_more is False or (
+                                    has_more is None and chunk == total
+                                )
+                                if terminal:
+                                    self.replay_pending = False
+                                    buffered_count = len(self.buffered_live)
+                                    self.progress.finish(buffered_count)
+                                    await self._flush_live()
+                                continue
+                            if message_type == self.handler.channel:
+                                if self.replay_pending:
+                                    self.buffered_live.append(message)
+                                else:
+                                    await self._process_live(message)
+                            if stop_event.is_set():
+                                break
+                        if monitor.done() and not monitor.cancelled():
+                            monitor.result()
+                        if self.progress.stalled:
+                            raise ReplayStalledError
+                        if not stop_event.is_set():
+                            raise OSError("WebSocket connection ended")
+                    finally:
+                        monitor.cancel()
+                        await asyncio.gather(monitor, return_exceptions=True)
             except SnapshotRequestError as exc:
+                self.progress.fail(f"snapshot HTTP {exc.status}")
                 logger.warning(
                     "%s snapshot request failed with HTTP status %d; retrying",
                     self.handler.channel,
@@ -648,6 +839,7 @@ class ChannelRunner:
                 await self._backoff(stop_event, attempt)
             except (
                 OSError,
+                ReplayStalledError,
                 WebSocketException,
                 asyncpg.PostgresError,
                 KeyError,
@@ -657,10 +849,12 @@ class ChannelRunner:
                 zstandard.ZstdError,
                 msgpack.UnpackException,
             ) as exc:
+                error_type = type(exc).__name__
+                self.progress.fail(error_type)
                 logger.warning(
                     "%s connection or payload failed (%s); retrying",
                     self.handler.channel,
-                    type(exc).__name__,
+                    error_type,
                 )
                 await self.handler.reset_after_failure()
                 attempt += 1

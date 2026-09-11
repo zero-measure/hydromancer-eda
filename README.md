@@ -143,6 +143,24 @@ unconditional `DROP` or `TRUNCATE`.
 PYTHONPATH=src python -m hydromancer_eda.main
 ```
 
+On reconnect, each channel logs when cursor-based backfill starts, a chunk progress
+bar with persisted-item and buffered-live counts, and a completion message. While
+replay is active it also emits periodic status. If replay stops advancing for 30
+seconds, the connection is closed and retried from the last durable cursor; retry
+attempts include their backoff delay. Tune this behavior with:
+
+```dotenv
+HYDROMANCER_REPLAY_STATUS_INTERVAL_SECONDS=5
+HYDROMANCER_REPLAY_STALL_TIMEOUT_SECONDS=30
+```
+
+L2 continuity recovery logs the snapshot request, periodic waiting status,
+snapshot installation, and successful alignment. A failed or non-aligning
+snapshot is reported explicitly before the channel reconnects.
+
+A `hasGap=true` replay is persisted but reported as an error because no
+market-wide REST endpoint can repair the missing interval.
+
 Inspect live state without exposing sessions or cursors:
 
 ```bash

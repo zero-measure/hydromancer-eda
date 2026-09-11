@@ -21,7 +21,15 @@ class Settings(BaseSettings):
     )
     l2_retention_hours: int = Field(default=168, alias="L2_RETENTION_HOURS", gt=0)
     l4_retention_hours: int = Field(default=24, alias="L4_RETENTION_HOURS", gt=0)
-    reconnect_delay_seconds: float = Field(default=1.0, alias="HYDROMANCER_RECONNECT_DELAY_SECONDS", gt=0)
+    reconnect_delay_seconds: float = Field(
+        default=1.0, alias="HYDROMANCER_RECONNECT_DELAY_SECONDS", gt=0
+    )
+    replay_status_interval_seconds: float = Field(
+        default=5.0, alias="HYDROMANCER_REPLAY_STATUS_INTERVAL_SECONDS", gt=0
+    )
+    replay_stall_timeout_seconds: float = Field(
+        default=30.0, alias="HYDROMANCER_REPLAY_STALL_TIMEOUT_SECONDS", gt=0
+    )
 
     @field_validator("hydromancer_coins")
     @classmethod

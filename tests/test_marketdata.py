@@ -11,6 +11,7 @@ from hydromancer_eda.config import Settings
 from hydromancer_eda.ingestion import marketdata
 from hydromancer_eda.ingestion.marketdata import (
     BookState,
+    ChannelRunner,
     L2BookHandler,
     L4BookHandler,
     LeverageHandler,
@@ -204,6 +205,81 @@ def test_l4_remove_uses_seeded_wallet_and_order_lifetime() -> None:
     assert store.l4[0].resting_seconds == 10
     assert store.l4[0].aggregate is False
     assert "42" not in handler.orders
+
+
+def test_expired_session_subscribes_from_durable_cursor(monkeypatch) -> None:
+    class RunnerStore:
+        async def load_checkpoint(self, _channel):
+            return "expired-session", "opaque:cursor"
+
+        async def persist_channel_cursor(self, *_args):
+            return None
+
+    class Handler:
+        channel = "testChannel"
+
+        def __init__(self):
+            self.subscription = {"type": self.channel, "coins": ["COIN"]}
+            self.store = RunnerStore()
+
+        async def ensure_ready(self):
+            return None
+
+        async def process(self, *_args):
+            return None
+
+        async def reset_after_failure(self):
+            return None
+
+    class Connection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def close(self):
+            return None
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def connect(self, _session, _cursor):
+            return Connection()
+
+        async def messages(self, _connection):
+            yield {"type": "connected", "sessionId": "replacement"}
+
+        async def send(self, _connection, frame):
+            self.sent.append(frame)
+
+    websocket = WebSocket()
+    monkeypatch.setattr(marketdata, "HydromancerWebSocket", lambda _token: websocket)
+    stop_event = asyncio.Event()
+
+    async def run():
+        runner = ChannelRunner(settings(), Handler())
+        task = asyncio.create_task(runner.run_forever(stop_event))
+        while not websocket.sent:
+            await asyncio.sleep(0)
+        stop_event.set()
+        await task
+        return runner
+
+    runner = asyncio.run(run())
+
+    assert websocket.sent == [
+        {
+            "method": "subscribe",
+            "subscription": {
+                "type": "testChannel",
+                "coins": ["COIN"],
+                "cursor": "opaque:cursor",
+            },
+        }
+    ]
+    assert runner.replay_pending
 
 
 def test_leverage_handler_keeps_explicit_and_target_leverage() -> None:

@@ -14,6 +14,7 @@ from websockets.exceptions import InvalidURI, WebSocketException
 
 from hydromancer_eda.client.ws import LIVE_FORMAT, HydromancerWebSocket, subscribe_frame
 from hydromancer_eda.config import Settings
+from hydromancer_eda.ingestion.progress import ReplayProgress
 from hydromancer_eda.labeling.flow_labels import FlowLabeler
 from hydromancer_eda.models import OrderflowEvent
 from hydromancer_eda.storage.postgres import PostgresStore
@@ -32,6 +33,14 @@ class ReplayBufferOverflow(Exception):
 
 class ReplayOrderError(Exception):
     """Replay chunks did not arrive in their documented order."""
+
+
+class ReplayProtocolError(Exception):
+    """The server rejected a subscription or reported a protocol failure."""
+
+
+class ReplayStalledError(Exception):
+    """Replay made no progress before its configured timeout."""
 
 
 class AllFillsIngestionService:
@@ -68,6 +77,12 @@ class AllFillsIngestionService:
         self._next_label_at = datetime.now(UTC)
         self._label_task: asyncio.Task[None] | None = None
         self._reconnect_attempt = 0
+        self._progress = ReplayProgress(
+            "allFills",
+            logger,
+            settings.replay_status_interval_seconds,
+            settings.replay_stall_timeout_seconds,
+        )
 
     async def initialise(self) -> None:
         """Connect storage, initialize its schema, and restore the checkpoint.
@@ -107,13 +122,18 @@ class AllFillsIngestionService:
         elif message_type == "subscriptionUpdate":
             failed = message.get("failed")
             if isinstance(failed, list) and failed:
-                logger.warning("allFills subscription rejected: %s", failed)
+                logger.error("allFills subscription rejected: %s; reconnecting", failed)
+                raise ReplayProtocolError
             elif isinstance(message.get("warnings"), list) and message["warnings"]:
                 logger.warning("allFills subscription warnings: %s", message["warnings"])
             else:
                 logger.info("allFills subscription update received")
         elif message_type == "error":
-            logger.warning("Hydromancer WebSocket error: %s", message.get("message", "unknown"))
+            logger.error(
+                "Hydromancer WebSocket reported an error: %s; reconnecting",
+                message.get("message", "unknown"),
+            )
+            raise ReplayProtocolError
         # Unknown types and additive fields are intentionally ignored.
 
     @staticmethod
@@ -142,7 +162,9 @@ class AllFillsIngestionService:
         self._check_live_format(message)
         if self._session_id is not None:
             # A resume attempt that became connected means session expiry/new session.
-            logger.warning("resume did not reconnect; session expired or a gap may exist")
+            logger.warning(
+                "resume did not reconnect; session expired, starting cursor-based backfill"
+            )
         self._session_id = session_id
         self._last_seq = 0
         self._replay_complete = self._cursor is None
@@ -152,6 +174,10 @@ class AllFillsIngestionService:
         self._buffered_live.clear()
         self._buffer_deadline = None
         self._reconnect_attempt = 0
+        if self._cursor is not None:
+            self._progress.start("new session resumed from durable cursor")
+        else:
+            logger.info("allFills connected with no prior cursor; live ingestion is ready")
         await self._commit([], self._cursor)
         # A subscription cursor recovers the short cache window after a new session.
         # Replay and live delivery can overlap, so buffer live data until replay
@@ -179,6 +205,7 @@ class AllFillsIngestionService:
         self._buffered_live.clear()
         self._buffer_deadline = None
         self._reconnect_attempt = 0
+        self._progress.start("existing session resumed")
         # Save the new session even before the first replay cursor arrives.
         await self._commit([], self._cursor)
 
@@ -216,16 +243,24 @@ class AllFillsIngestionService:
                 chunk,
             )
             raise ReplayOrderError
-        if message.get("hasGap") is True:
-            logger.warning("allFills replay reports hasGap=true; market-wide REST repair is unavailable")
+        has_gap = message.get("hasGap") is True
+        if has_gap:
+            logger.error(
+                "allFills replay reports hasGap=true; available replay will be persisted, "
+                "but market-wide REST repair is unavailable"
+            )
         await self._process_entries(data, cursor)
         self._replay_total = total
         self._replay_chunks.add(chunk)
         self._next_replay_chunk += 1
-        if len(self._replay_chunks) == total:
+        self._progress.advance(chunk, total, len(data), has_gap, len(self._buffered_live))
+        has_more = message.get("hasMore")
+        terminal = has_more is False or (has_more is None and len(self._replay_chunks) == total)
+        if terminal:
             self._replay_complete = True
             self._buffer_deadline = None
             buffered, self._buffered_live = self._buffered_live, []
+            self._progress.finish(len(buffered))
             for live in buffered:  # Preserve socket arrival order.
                 await self._process_live(live)
 
@@ -256,9 +291,11 @@ class AllFillsIngestionService:
                 self._buffered_live.append(message)
                 return
             logger.warning(
-                "no replay within grace after reconnected; flushing %d buffered live frames",
+                "no replay within grace after reconnect; no cached events need backfilling; "
+                "flushing %d buffered live frames",
                 len(self._buffered_live),
             )
+            self._progress.finish(len(self._buffered_live), "no replay returned within grace period")
             self._replay_complete = True
             self._buffer_deadline = None
             buffered, self._buffered_live = self._buffered_live, []
@@ -410,6 +447,34 @@ class AllFillsIngestionService:
         except Exception:
             logger.exception("wallet labeling failed")
 
+    async def _finish_no_replay(self) -> None:
+        """Declare recovery current when the server sends no replay within grace."""
+        if self._replay_complete or not self._progress.active:
+            return
+        logger.info("allFills sent no replay within %.1fs; cursor is current", REPLAY_GRACE_SECONDS)
+        self._replay_complete = True
+        self._buffer_deadline = None
+        buffered, self._buffered_live = self._buffered_live, []
+        self._progress.finish(len(buffered), "no replay required")
+        for live in buffered:
+            await self._process_live(live)
+
+    async def _backoff(self, stop_event: asyncio.Event) -> None:
+        """Report and wait for the next reconnect attempt."""
+        exponent = min(self._reconnect_attempt, MAX_BACKOFF_EXPONENT)
+        maximum = min(self._settings.reconnect_delay_seconds * (2**exponent), 30.0)
+        delay = random.uniform(maximum / 2, maximum)
+        self._reconnect_attempt += 1
+        logger.warning(
+            "allFills reconnect attempt %d starts in %.1fs from the durable cursor",
+            self._reconnect_attempt,
+            delay,
+        )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+
     async def _close_on_stop(self, connection: Any, stop_event: asyncio.Event) -> None:
         """Close a connection after the service stop event is set.
 
@@ -446,6 +511,15 @@ class AllFillsIngestionService:
                     connection = await websocket.connect(self._session_id, self._cursor)
                     async with connection:
                         stopper = asyncio.create_task(self._close_on_stop(connection, stop_event))
+                        monitor = asyncio.create_task(
+                            self._progress.monitor(
+                                connection,
+                                stop_event,
+                                lambda: len(self._buffered_live),
+                                REPLAY_GRACE_SECONDS,
+                                self._finish_no_replay,
+                            )
+                        )
                         try:
                             async def send(frame: dict[str, Any], conn: Any = connection) -> None:
                                 """Send a frame through the connection captured for this loop."""
@@ -455,9 +529,16 @@ class AllFillsIngestionService:
                                 await self.handle_message(message, send)
                                 if stop_event.is_set():
                                     break
+                            if monitor.done() and not monitor.cancelled():
+                                monitor.result()
+                            if self._progress.stalled:
+                                raise ReplayStalledError
+                            if not stop_event.is_set():
+                                raise OSError("WebSocket connection ended")
                         finally:
                             stopper.cancel()
-                            await asyncio.gather(stopper, return_exceptions=True)
+                            monitor.cancel()
+                            await asyncio.gather(stopper, monitor, return_exceptions=True)
                 except (
                     OSError,
                     InvalidURI,
@@ -465,13 +546,17 @@ class AllFillsIngestionService:
                     asyncpg.PostgresError,
                     ReplayBufferOverflow,
                     ReplayOrderError,
-                ):
+                    ReplayProtocolError,
+                    ReplayStalledError,
+                ) as exc:
                     # Transport exceptions can include the token-bearing URL; never log them.
-                    logger.warning("allFills connection or database operation failed; retrying")
-                    exponent = min(self._reconnect_attempt, MAX_BACKOFF_EXPONENT)
-                    delay = min(self._settings.reconnect_delay_seconds * (2 ** exponent), 30.0)
-                    self._reconnect_attempt += 1
-                    await asyncio.sleep(random.uniform(delay / 2, delay))
+                    error_type = type(exc).__name__
+                    self._progress.fail(error_type)
+                    logger.warning(
+                        "allFills connection or database operation failed (%s)",
+                        error_type,
+                    )
+                    await self._backoff(stop_event)
         finally:
             if self._label_task:
                 self._label_task.cancel()
