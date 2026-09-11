@@ -11,6 +11,7 @@
 # Python and Jupyter
 __pycache__/
 .ipynb_checkpoints/
+/Untitled.ipynb
 *.py[cod]
 .pytest_cache/
 .mypy_cache/

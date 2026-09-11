@@ -25,6 +25,11 @@ from websockets.exceptions import WebSocketException
 
 from hydromancer_eda.client.ws import HydromancerWebSocket
 from hydromancer_eda.config import Settings
+from hydromancer_eda.ingestion.orderbook import (
+    L4Snapshot,
+    decode_l2_snapshots,
+    decode_l4_snapshot,
+)
 from hydromancer_eda.ingestion.progress import ReplayProgress
 from hydromancer_eda.models import L2BookTick, L4OrderEvent, LeverageUpdate, Side
 from hydromancer_eda.storage.postgres import PostgresStore
@@ -49,47 +54,6 @@ def _timestamp(value: float) -> datetime:
     return datetime.fromtimestamp(float(value) / 1000, tz=UTC)
 
 
-def decode_l2_snapshots(payload: bytes) -> list[list[Any]]:
-    """Decode single-msgpack or length-prefixed multi-zstd L2 snapshots."""
-    if len(payload) >= 12 and payload[8:12] == b"\x28\xb5\x2f\xfd":
-        count = struct.unpack_from("<I", payload)[0]
-        offset = 4
-        snapshots: list[Any] = []
-        decompressor = zstandard.ZstdDecompressor()
-        for _ in range(count):
-            if offset + 4 > len(payload):
-                raise ValueError("Truncated L2 snapshot blob-length field")
-            blob_length = struct.unpack_from("<I", payload, offset)[0]
-            offset += 4
-            blob = payload[offset : offset + blob_length]
-            if len(blob) != blob_length:
-                raise ValueError("Truncated L2 snapshot compressed blob")
-            offset += blob_length
-            with decompressor.stream_reader(blob) as reader:
-                snapshots.append(msgpack.unpackb(reader.read(), raw=False))
-        if offset != len(payload):
-            raise ValueError("Unexpected trailing bytes in L2 snapshot response")
-    else:
-        unpacker = msgpack.Unpacker(raw=False)
-        unpacker.feed(payload)
-        objects = list(unpacker)
-        if not objects or unpacker.tell() != len(payload):
-            raise ValueError("Empty or truncated L2 snapshot response")
-        if len(objects) > 1:
-            snapshots = objects
-        else:
-            decoded = objects[0]
-            snapshots = [decoded] if decoded and isinstance(decoded[0], str) else decoded
-    if not all(
-        isinstance(snapshot, list)
-        and len(snapshot) == 6
-        and isinstance(snapshot[0], str)
-        for snapshot in snapshots
-    ):
-        raise ValueError("Unexpected L2 snapshot response shape")
-    return cast(list[list[Any]], snapshots)
-
-
 def _post_snapshot(token: str, payload: dict[str, Any]) -> bytes:
     request = urllib.request.Request(
         "https://api.hydromancer.xyz/info",
@@ -106,6 +70,11 @@ def _post_snapshot(token: str, payload: dict[str, Any]) -> bytes:
             return response.read()
     except urllib.error.HTTPError as exc:
         raise SnapshotRequestError(exc.code) from None
+
+
+def fetch_l4_book_snapshot(token: str, coins: list[str]) -> L4Snapshot:
+    """Fetch and decode one L4 bootstrap snapshot for a live monitor."""
+    return decode_l4_snapshot(_post_snapshot(token, {"type": "l4Book", "coins": coins}))
 
 
 @dataclass
@@ -440,35 +409,26 @@ class L4BookHandler:
         """Seed resting-order attribution from the documented L4 snapshot."""
         if self.ready:
             return
-        raw = await asyncio.to_thread(
-            _post_snapshot,
+        snapshot = await asyncio.to_thread(
+            fetch_l4_book_snapshot,
             self.settings.hydromancer_api_key,
-            {"type": "l4Book", "coins": self.settings.coins},
+            self.settings.coins,
         )
-        count, snapshot_height, timestamp_ms = struct.unpack_from("<IQQ", raw, 0)
-        offset = 20
-        decompressor = zstandard.ZstdDecompressor()
-        snapshot_ts = _timestamp(timestamp_ms)
-        for _ in range(count):
-            blob_length = struct.unpack_from("<I", raw, offset)[0]
-            offset += 4
-            blob = raw[offset : offset + blob_length]
-            offset += blob_length
-            with decompressor.stream_reader(blob) as reader:
-                decoded = msgpack.unpackb(reader.read(), raw=False)
-            coin = str(decoded[0])
-            for side_name, orders in (("buy", decoded[1]), ("sell", decoded[2])):
-                for user, price, size, order_id in orders:
-                    self.orders[str(order_id)] = RestingOrder(
+        snapshot_ts = _timestamp(snapshot["timestamp_ms"])
+        for market in snapshot["markets"]:
+            coin = str(market["coin"])
+            for side_name, orders in (("buy", market["bids"]), ("sell", market["asks"])):
+                for order in orders:
+                    self.orders[str(order["order_id"])] = RestingOrder(
                         ts=snapshot_ts,
                         symbol=coin,
-                        wallet=str(user).lower(),
+                        wallet=str(order["wallet"]),
                         side=cast(Side, side_name),
-                        price=Decimal(str(price)),
-                        size=Decimal(str(size)),
+                        price=Decimal(str(order["price"])),
+                        size=Decimal(str(order["size"])),
                         tracked=False,
                     )
-        self.snapshot_height = int(snapshot_height)
+        self.snapshot_height = int(snapshot["height"])
         self.ready = True
 
     async def reset_after_failure(self) -> None:

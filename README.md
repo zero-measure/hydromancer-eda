@@ -88,6 +88,41 @@ docker exec hydromancer-timescaledb \
   pg_isready --username postgres --dbname hydromancer
 ```
 
+### Stop and restart TimescaleDB safely
+
+Give PostgreSQL up to 30 seconds to checkpoint and shut down cleanly instead of
+force-killing the Docker VM:
+
+```bash
+docker stop --time 30 hydromancer-timescaledb
+```
+
+Confirm that the container stopped normally. A clean shutdown reports
+`status=exited`, `running=false`, and `exit_code=0`:
+
+```bash
+docker inspect hydromancer-timescaledb \
+  --format 'status={{.State.Status}} running={{.State.Running}} exit_code={{.State.ExitCode}}'
+```
+
+If Docker Desktop is no longer needed, quit it after the container has stopped
+to release the memory retained by its virtual machine:
+
+```bash
+osascript -e 'tell application "Docker" to quit'
+```
+
+Start Docker Desktop and the existing container again with:
+
+```bash
+open -a Docker
+# Wait until Docker Desktop is ready.
+docker start hydromancer-timescaledb
+```
+
+The container uses the `hydromancer-timescaledb-data` volume, so stopping the
+container or quitting Docker Desktop does not delete the database.
+
 ## Installation and configuration
 
 ```bash
@@ -97,7 +132,7 @@ pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-For the Jupyter debugging environment, install and register the project kernel:
+For optional Jupyter and Plotly exploration, install and register the project kernel:
 
 ```bash
 python3 -m venv .venv
@@ -106,10 +141,10 @@ pip install -e '.[notebooks]'
 python -m ipykernel install --user \
   --name hydromancer-eda \
   --display-name 'Hydromancer EDA (.venv)'
-jupyter lab notebooks/debug_hydromancer_snapshot_403.ipynb
 ```
 
-The notebook is configured to select `Hydromancer EDA (.venv)` automatically.
+The L2/L4 ingestion wire formats and wallet-monitoring feature boundaries are
+documented in `src/hydromancer_eda/ingestion/orderbook/README.md`.
 
 Set at least:
 
@@ -154,12 +189,57 @@ HYDROMANCER_REPLAY_STATUS_INTERVAL_SECONDS=5
 HYDROMANCER_REPLAY_STALL_TIMEOUT_SECONDS=30
 ```
 
-L2 continuity recovery logs the snapshot request, periodic waiting status,
-snapshot installation, and successful alignment. A failed or non-aligning
-snapshot is reported explicitly before the channel reconnects.
-
 A `hasGap=true` replay is persisted but reported as an error because no
 market-wide REST endpoint can repair the missing interval.
+
+### Monitor the live L4 order book
+
+The wallet-attributed order-book display runs as a Jupyter `FigureWidget`. Start
+it from the repository root with:
+
+```bash
+PYTHONPATH=src .venv/bin/jupyter lab
+```
+
+In a notebook using the `Hydromancer EDA (.venv)` kernel, run:
+
+```python
+import asyncio
+
+from hydromancer_eda.config import get_settings
+from hydromancer_eda.ingestion.marketdata import fetch_l4_book_snapshot
+from hydromancer_eda.visualization.l4 import animate_l4_book, stream_l4_book_updates
+
+settings = get_settings()
+coin = settings.coins[0]
+
+# Seed the widget, then subscribe and fetch a fresh aligned snapshot while
+# WebSocket updates queue. Do not poll the rate-limited REST snapshot.
+initial = await asyncio.to_thread(
+    fetch_l4_book_snapshot, settings.hydromancer_api_key, [coin]
+)
+animator = animate_l4_book(initial, coin=coin, level_count=12, minimum_named_share=1.0)
+live_l4_task = asyncio.create_task(
+    stream_l4_book_updates(
+        animator,
+        settings.hydromancer_api_key,
+        snapshot_fetcher=lambda: fetch_l4_book_snapshot(
+            settings.hydromancer_api_key, [coin]
+        ),
+        max_fps=5.0,
+    )
+)
+```
+
+To stop the live monitor without shutting down Jupyter:
+
+```python
+live_l4_task.cancel()
+await asyncio.gather(live_l4_task, return_exceptions=True)
+```
+
+This displays L4 wallet-attributed orders grouped into price levels. L2 remains
+the aggregate source used for spread, imbalance, event volatility, and markouts.
 
 Inspect live state without exposing sessions or cursors:
 
