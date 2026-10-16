@@ -1,7 +1,11 @@
-# hydromancer-eda
+# toxic-flow features and markouts for wallet classification
 
-Real-time wallet toxic-flow classification from Hydromancer executions, L2 book
-diffs, L4 order lifecycle updates, and market-wide leverage changes.
+Real-time wallet-level feature extraction and event-time markouts from Hydromancer
+executions, L2 book diffs, L4 order lifecycle updates, and market-wide leverage
+changes.
+
+The project builds inputs for future wallet classification. It does **not** yet
+classify wallets or separate retail flow from informed flow.
 
 ## Data streams
 
@@ -22,7 +26,7 @@ diffs on height, and re-bootstraps on a per-coin sequence gap, epoch change, or
 resync signal. The L4 snapshot seeds wallet attribution for orders already
 resting when the process starts.
 
-## Classifier data
+## Feature and markout data
 
 `orderflow_events` retains only execution fields relevant to classification.
 Liquidation is true only when the participant wallet equals
@@ -57,8 +61,9 @@ signed_log_markout / (trailing_symbol_event_volatility * sqrt(event_horizon))
 The volatility estimate is stored on the latest L2 tick available before the
 fill, so no post-fill volatility enters the normalization. Samples crossing an
 L2 epoch or exceeding the elapsed-time bound are excluded. Matured samples are
-retained after source L2 ticks expire. Wallet labels store p10 through p90 and
-sample count for each horizon in `markout_metrics`.
+retained after source L2 ticks expire. The `wallet_flow_labels` table stores
+wallet feature snapshots, not retail/informed classifications. Each snapshot
+includes p10 through p90 and sample count for each horizon in `markout_metrics`.
 
 ## Prerequisites
 
@@ -150,7 +155,7 @@ Set at least:
 
 ```dotenv
 HYDROMANCER_API_KEY=replace-with-your-api-key
-HYDROMANCER_COINS=xyz:KORU
+HYDROMANCER_COINS=SOL,BTC,ETH
 PG_DSN=postgresql://postgres:postgres@localhost:5432/hydromancer
 ```
 
@@ -174,9 +179,29 @@ unconditional `DROP` or `TRUNCATE`.
 
 ## Run ingestion
 
+This dataset is restricted to **SOL, BTC, and ETH**. Use the launcher so an older
+local `.env` coin selection cannot accidentally override that policy:
+
 ```bash
-PYTHONPATH=src python -m hydromancer_eda.main
+./run_ingestion.sh
 ```
+
+To permanently remove other coins from an existing database, stop ingestion and
+run the explicit migration once:
+
+```bash
+./query_db.sh sql/restrict_to_majors.sql
+```
+
+The migration deletes non-major fills, books, leverage, order aggregates, markout
+samples, and explicitly identified non-major rejects. It clears mixed-market
+wallet labels for recomputation, retains existing major history, and installs
+`dataset_majors_only` database constraints to reject future non-major writes.
+It resets session IDs (not opaque cursors) so subscriptions are recreated for the
+new selection. All consumers also filter incoming records to the configured coins,
+including the unfiltered `allLeverageUpdates` stream. Changing `.env` alone cannot
+undo the database restriction. A full analytical reset drops these constraints;
+reapply the migration after recreating the schema if performing such a reset.
 
 On reconnect, each channel logs when cursor-based backfill starts, a chunk progress
 bar with persisted-item and buffered-live counts, and a completion message. While
@@ -249,7 +274,7 @@ docker exec -i hydromancer-timescaledb \
   < sql/inspect_live.sql
 ```
 
-Inspect classifier labels:
+Inspect wallet features and markouts:
 
 ```bash
 docker exec -i hydromancer-timescaledb \
@@ -284,6 +309,60 @@ DATABASE=hydromancer \
 DB_USER=postgres \
 ./query_db.sh
 ```
+
+## Funding versus hourly position flow
+
+The installable `hydromancer-funding-flow` batch command charts historical
+`fundingHistory` observations against hourly taker position flow already captured
+from the market-wide `allFills` WebSocket. Hydromancer funding history is available
+from `2025-07-28T00:00:00Z`:
+
+```bash
+hydromancer-funding-flow \
+  --coin BTC --coin xyz:GOLD \
+  --start 2025-08-01 --end 2025-08-07 \
+  --html output/funding-flow.html --csv output/funding-flow.csv
+```
+
+Coin values are case-sensitive and preserved exactly. Intervals are half-open UTC.
+A date-only start means inclusive midnight; a date-only end includes that entire
+named date by advancing to the next midnight. Timestamp ends are exact exclusive
+bounds; naive timestamps are interpreted as UTC and offsets are converted to UTC.
+Funding observations retain their true
+millisecond timestamp in the model, CSV, plot x-coordinate, and hover; the hour is
+only an association key.
+
+Flow uses only the taker participant row (`crossed=true`) so a trade is not counted
+for both parties. Long/short flips are split by the documented `startPosition` and
+fill size. The output reports total, classified, unclassified notional, and
+classification coverage and requested-interval coverage. Net values are null
+(visible plot gaps) for empty, incompletely classified, or partial edge hours unless
+`--allow-partial` is explicitly supplied. Missing values are never changed to zero.
+A locally absent hour stays null; it is not proof that market activity was zero.
+An `allFills` replay `hasGap` is persisted in `ingestion_gaps`; intersecting hours
+are marked with a known source gap and their net values remain null unless
+`--allow-partial` is explicit. A collector outage that never reconnects cannot always
+be detected automatically, so users must still verify operational monitoring.
+
+New `allFills` rows persist `dir` and `startPosition`. Historical market-wide REST
+repair does not exist: `builderFills` is not a market-wide source and is never used.
+For known wallets only, `--backfill-wallet 0x...` uses documented
+`userFillsByTime`, updates exact matching rows, records provenance in
+`direction_backfill_runs` (including local candidates, matched and unusable rows,
+match coverage, source completion, limitations, and failure type), and leaves every unmatched row null. Hydromancer states
+that user fills are fully available from 2025-07-28 for most traders, with gaps
+possible for very high-volume addresses, and TWAP coverage from 2025-08-02.
+Consequently, this path never claims market-wide completeness. For full pages the
+client forms the documented `time_txIndex` continuation from the final record, then
+passes that cursor string back unchanged and never parses it.
+
+`--current-rate` optionally waits a bounded time for one `fundingRates` WebSocket
+message. It responds to every ping, suppresses token-bearing transport details,
+and only supplements a point inside the requested interval. Historical funding
+always comes from REST with bounded retries, rate-limit handling, pagination
+stall/overlap protection, exact Decimal parsing, and local half-open filtering.
+Malformed pages fail closed. HTML uses a stable Plotly div id and embedded runtime
+for deterministic, self-contained output.
 
 ## Publication safety
 

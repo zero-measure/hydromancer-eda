@@ -195,6 +195,8 @@ class L2BookHandler:
             for snapshot in snapshots:
                 coin, _time_ms, levels, _height, epoch, source_seq = snapshot
                 coin_name = str(coin)
+                if coin_name not in coins:
+                    continue
                 event_no = await self.store.next_l2_event_number(coin_name)
                 mids = await self.store.recent_l2_mids(
                     coin_name, self.settings.l2_volatility_lookback + 1
@@ -283,7 +285,7 @@ class L2BookHandler:
         if data.get("type") == "resync":
             coin = str(data.get("coin", ""))
             self.states.pop(coin, None)
-            if coin:
+            if coin in self.settings.coins:
                 await self._bootstrap([coin])
             await self.store.persist_channel_cursor(self.channel, session_id, cursor)
             return
@@ -294,6 +296,8 @@ class L2BookHandler:
         state_rows: list[tuple[str, str, int, int, int, datetime]] = []
         for diff in data.get("diffs", []):
             coin = str(diff["coin"])
+            if coin not in self.settings.coins:
+                continue
             state = self.states.get(coin)
             if state is None:
                 await self._bootstrap([coin])
@@ -417,6 +421,8 @@ class L4BookHandler:
         snapshot_ts = _timestamp(snapshot["timestamp_ms"])
         for market in snapshot["markets"]:
             coin = str(market["coin"])
+            if coin not in self.settings.coins:
+                continue
             for side_name, orders in (("buy", market["bids"]), ("sell", market["asks"])):
                 for order in orders:
                     self.orders[str(order["order_id"])] = RestingOrder(
@@ -449,12 +455,18 @@ class L4BookHandler:
         events: list[L4OrderEvent] = []
         orders = self.orders.copy()
         for event_index, diff in enumerate(data.get("diffs", [])):
+            coin = diff.get("coin")
+            if coin is not None and coin not in self.settings.coins:
+                continue
             event_type_value = str(diff["type"])
             if event_type_value not in {"new", "update", "remove"}:
                 continue
             event_type = cast(Literal["new", "update", "remove"], event_type_value)
             order_id = str(diff["oid"])
             existing = orders.get(order_id)
+            symbol = str(coin or (existing.symbol if existing else "unknown"))
+            if symbol not in self.settings.coins:
+                continue
             if event_type == "new":
                 side = cast(Side, "buy" if str(diff.get("side")) == "B" else "sell")
                 existing = RestingOrder(
@@ -483,7 +495,7 @@ class L4BookHandler:
                     ts=ts,
                     height=height,
                     event_index=event_index,
-                    symbol=str(diff.get("coin") or (existing.symbol if existing else "unknown")),
+                    symbol=symbol,
                     order_id=order_id,
                     wallet=existing.wallet if existing else None,
                     event_type=event_type,
@@ -505,7 +517,8 @@ class LeverageHandler:
 
     channel = "allLeverageUpdates"
 
-    def __init__(self, _settings: Settings, store: PostgresStore) -> None:
+    def __init__(self, settings: Settings, store: PostgresStore) -> None:
+        self.settings = settings
         self.store = store
         self.subscription = {"type": self.channel}
 
@@ -527,6 +540,8 @@ class LeverageHandler:
             items = payload
         updates: list[LeverageUpdate] = []
         for item in items if isinstance(items, list) else []:
+            if item.get("coin") not in self.settings.coins:
+                continue
             update_type_value = str(item.get("update_type"))
             if update_type_value not in {
                 "leverage",

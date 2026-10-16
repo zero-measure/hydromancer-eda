@@ -3,6 +3,7 @@
 -- One-time destructive reset for analytics schema version 2. Operational
 -- checkpoints and ingestion rejects are intentionally preserved.
 BEGIN;
+DROP TABLE IF EXISTS public.direction_backfill_runs CASCADE;
 DROP TABLE IF EXISTS public.wallet_flow_labels CASCADE;
 DROP TABLE IF EXISTS public.wallet_markout_samples CASCADE;
 DROP TABLE IF EXISTS public.wallet_leverage_state CASCADE;

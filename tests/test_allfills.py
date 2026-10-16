@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from datetime import UTC, datetime
 from importlib.resources import files
 
 import pytest
@@ -19,7 +20,15 @@ from hydromancer_eda.models import OrderflowEvent
 class Store:
     def __init__(self):
         self.frames = []
+        self.gaps = []
         self.pool = object()
+
+    async def latest_orderflow_timestamp(self):
+        events = [event for frame in self.frames for event in frame[0]]
+        return max((event.ts for event in events), default=None)
+
+    async def record_ingestion_gap(self, channel, start_ts, end_ts, reason):
+        self.gaps.append((channel, start_ts, end_ts, reason))
 
     async def persist_allfills_frame(
         self, events, session_id, cursor, channel="allFills", rejected_entries=None
@@ -240,6 +249,46 @@ def test_envelope_wallet_is_canonical_for_storage_and_dedupe():
         event = store.frames[-1][0][0]
         assert event.wallet == "0xabc"
         assert event.raw["address"] == "0xabc"
+
+    asyncio.run(run())
+
+
+def test_server_reported_replay_gap_is_persisted_once() -> None:
+    async def run() -> None:
+        store = Store()
+        service = AllFillsIngestionService(settings(), store)
+        quiet(service)
+        service._replay_complete = False
+        service._progress.start("test")
+        await service._replay(
+            {
+                "type": "replay",
+                "channel": "allFills",
+                "cursor": "opaque-one",
+                "chunk": 1,
+                "totalChunks": 2,
+                "hasMore": True,
+                "hasGap": True,
+                "data": [fill(time=10)],
+            }
+        )
+        await service._replay(
+            {
+                "type": "replay",
+                "channel": "allFills",
+                "cursor": "opaque-two",
+                "chunk": 2,
+                "totalChunks": 2,
+                "hasMore": False,
+                "hasGap": True,
+                "data": [fill(time=11)],
+            }
+        )
+        assert len(store.gaps) == 1
+        channel, start_ts, end_ts, reason = store.gaps[0]
+        assert channel == "allFills"
+        assert start_ts == end_ts == datetime.fromtimestamp(0.01, tz=UTC)
+        assert reason == "replay_has_gap"
 
     asyncio.run(run())
 

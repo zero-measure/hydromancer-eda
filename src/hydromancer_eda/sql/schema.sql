@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS ingestion_gaps (
+    id BIGSERIAL PRIMARY KEY,
+    channel TEXT NOT NULL,
+    start_ts TIMESTAMPTZ NOT NULL,
+    end_ts TIMESTAMPTZ NOT NULL,
+    reason TEXT NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (end_ts >= start_ts)
+);
+CREATE INDEX IF NOT EXISTS ingestion_gaps_channel_time_idx
+ON ingestion_gaps (channel, start_ts, end_ts);
+
 CREATE TABLE IF NOT EXISTS ingestion_rejects (
     id BIGSERIAL PRIMARY KEY,
     channel TEXT NOT NULL,
@@ -75,6 +87,55 @@ CREATE INDEX IF NOT EXISTS orderflow_events_symbol_ts_idx
 ON orderflow_events (symbol, ts DESC);
 CREATE INDEX IF NOT EXISTS orderflow_events_order_id_idx
 ON orderflow_events (order_id, ts DESC) WHERE order_id IS NOT NULL;
+
+-- Additive nullable direction fields: old rows remain explicitly unclassified.
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS direction TEXT;
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS start_position NUMERIC;
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS direction_provenance TEXT;
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS start_position_provenance TEXT;
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS direction_reconstructed_at TIMESTAMPTZ;
+ALTER TABLE orderflow_events ADD COLUMN IF NOT EXISTS start_position_reconstructed_at TIMESTAMPTZ;
+DO $$
+BEGIN
+    ALTER TABLE orderflow_events ADD CONSTRAINT orderflow_direction_provenance_check
+        CHECK (direction_provenance IS NULL OR direction_provenance IN ('allFills', 'userFillsByTime'))
+        NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$
+BEGIN
+    ALTER TABLE orderflow_events ADD CONSTRAINT orderflow_start_position_provenance_check
+        CHECK (start_position_provenance IS NULL OR start_position_provenance IN ('allFills', 'userFillsByTime'))
+        NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS direction_backfill_runs (
+    id BIGSERIAL PRIMARY KEY,
+    wallet TEXT NOT NULL,
+    start_ts TIMESTAMPTZ NOT NULL,
+    end_ts TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL CHECK (source = 'userFillsByTime'),
+    source_limitations TEXT NOT NULL,
+    fetched_count BIGINT NOT NULL,
+    matched_count BIGINT NOT NULL,
+    local_candidate_count BIGINT NOT NULL DEFAULT 0,
+    unusable_count BIGINT NOT NULL DEFAULT 0,
+    rejected_count BIGINT NOT NULL DEFAULT 0,
+    coverage NUMERIC,
+    source_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    failure_type TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'running';
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS failure_type TEXT;
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS local_candidate_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS unusable_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS rejected_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS coverage NUMERIC;
+ALTER TABLE direction_backfill_runs ADD COLUMN IF NOT EXISTS source_complete BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS l2_event_counters (
     symbol TEXT PRIMARY KEY,

@@ -72,6 +72,7 @@ class AllFillsIngestionService:
         self._replay_chunks: set[int] = set()
         self._next_replay_chunk = 1
         self._replay_total: int | None = None
+        self._gap_recorded = False
         self._buffered_live: list[dict[str, Any]] = []
         self._buffer_deadline: float | None = None
         self._next_label_at = datetime.now(UTC)
@@ -171,6 +172,7 @@ class AllFillsIngestionService:
         self._replay_chunks.clear()
         self._next_replay_chunk = 1
         self._replay_total = None
+        self._gap_recorded = False
         self._buffered_live.clear()
         self._buffer_deadline = None
         self._reconnect_attempt = 0
@@ -202,12 +204,43 @@ class AllFillsIngestionService:
         self._replay_chunks.clear()
         self._next_replay_chunk = 1
         self._replay_total = None
+        self._gap_recorded = False
         self._buffered_live.clear()
         self._buffer_deadline = None
         self._reconnect_attempt = 0
         self._progress.start("existing session resumed")
         # Save the new session even before the first replay cursor arrives.
         await self._commit([], self._cursor)
+
+    async def _record_replay_gap(self, data: list[Any]) -> None:
+        """Persist conservative time bounds for a server-reported replay gap."""
+        previous = await self._store.latest_orderflow_timestamp()
+        earliest: datetime | None = None
+        for entry in data:
+            if not (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and isinstance(entry[1], dict)
+            ):
+                continue
+            value = entry[1].get("time")
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            try:
+                timestamp = datetime.fromtimestamp(value / 1000, tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                continue
+            earliest = timestamp if earliest is None else min(earliest, timestamp)
+        detected = datetime.now(UTC)
+        gap_end = earliest or detected
+        gap_start = previous or gap_end
+        await self._store.record_ingestion_gap(
+            "allFills",
+            gap_start,
+            max(gap_start, gap_end),
+            "replay_has_gap",
+        )
+        self._gap_recorded = True
 
     async def _replay(self, message: dict[str, Any]) -> None:
         """Validate and process one ordered replay chunk.
@@ -249,6 +282,8 @@ class AllFillsIngestionService:
                 "allFills replay reports hasGap=true; available replay will be persisted, "
                 "but market-wide REST repair is unavailable"
             )
+            if not self._gap_recorded:
+                await self._record_replay_gap(data)
         await self._process_entries(data, cursor)
         self._replay_total = total
         self._replay_chunks.add(chunk)
@@ -352,6 +387,9 @@ class AllFillsIngestionService:
                 rejected.append({"reason": reason, "entry": entry})
                 continue
             fill = dict(entry[1])
+            # A resumed session may still deliver its previous coin selection.
+            if isinstance(fill.get("coin"), str) and fill["coin"] not in self._settings.coins:
+                continue
             canonical_wallet = entry[0].strip().lower()
             fill["address"] = canonical_wallet
             try:

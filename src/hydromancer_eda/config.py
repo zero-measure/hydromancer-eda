@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     hydromancer_api_key: str = Field(alias="HYDROMANCER_API_KEY", min_length=1)
-    hydromancer_coins: str = Field(default="BTC,ETH", alias="HYDROMANCER_COINS")
+    hydromancer_coins: str = Field(default="SOL,BTC,ETH", alias="HYDROMANCER_COINS")
     pg_dsn: str = Field(alias="PG_DSN")
     label_interval_seconds: int = Field(default=3600, alias="LABEL_INTERVAL_SECONDS", gt=0)
     l2_volatility_lookback: int = Field(default=1000, alias="L2_VOLATILITY_LOOKBACK", ge=20)

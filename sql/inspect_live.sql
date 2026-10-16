@@ -65,3 +65,10 @@ SELECT channel, COUNT(*) AS rejected_rows, MAX(created_at) AS latest_reject
 FROM ingestion_rejects
 GROUP BY channel
 ORDER BY channel;
+
+\echo ''
+\echo '=== Known ingestion gaps (latest 20) ==='
+SELECT channel, start_ts, end_ts, reason, detected_at
+FROM ingestion_gaps
+ORDER BY detected_at DESC
+LIMIT 20;

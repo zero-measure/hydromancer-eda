@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 Aggressor = Literal["taker", "maker", "unknown"]
 Side = Literal["buy", "sell", "unknown"]
+DirectionProvenance = Literal["allFills", "userFillsByTime"]
 
 
 def _first_present(payload: dict[str, Any], *keys: str) -> Any:
@@ -36,6 +37,10 @@ class OrderflowEvent(BaseModel):
     trade_id: str | None = None
     tx_index: int
     realized_pnl: Decimal | None = None
+    direction: str | None = None
+    start_position: Decimal | None = None
+    direction_provenance: DirectionProvenance | None = None
+    start_position_provenance: DirectionProvenance | None = None
     liquidation: bool = False
     liquidation_mark_price: Decimal | None = None
     liquidation_method: str | None = None
@@ -107,6 +112,8 @@ class OrderflowEvent(BaseModel):
         oid = _first_present(payload, "oid", "order_id")
         tid = _first_present(payload, "tid", "trade_id")
         realized_pnl = _first_present(payload, "closedPnl", "realized_pnl")
+        direction = payload.get("dir")
+        start_position = payload.get("startPosition")
 
         return cls(
             ts=ts,
@@ -121,6 +128,12 @@ class OrderflowEvent(BaseModel):
             trade_id=None if tid is None else str(tid),
             tx_index=int(payload["txIndex"]),
             realized_pnl=Decimal(str(realized_pnl)) if realized_pnl is not None else None,
+            direction=str(direction) if direction is not None else None,
+            start_position=(
+                Decimal(str(start_position)) if start_position is not None else None
+            ),
+            direction_provenance="allFills" if direction is not None else None,
+            start_position_provenance="allFills" if start_position is not None else None,
             liquidation=liquidation,
             liquidation_mark_price=(
                 Decimal(str(liquidation_mark))
@@ -133,6 +146,53 @@ class OrderflowEvent(BaseModel):
                 else None
             ),
             raw=payload,
+        )
+
+
+class FundingObservation(BaseModel):
+    """One exact-timestamp funding-rate observation."""
+
+    coin: str
+    ts: datetime
+    rate: Decimal
+    source: Literal["fundingHistory", "fundingRates"] = "fundingHistory"
+
+    @field_validator("coin")
+    @classmethod
+    def validate_coin(cls, value: str) -> str:
+        """Require a nonempty case-preserved protocol coin identifier."""
+        if not value:
+            raise ValueError("coin must not be empty")
+        return value
+
+    @field_validator("ts")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        """Require an aware timestamp and normalize it to UTC without rounding."""
+        if value.tzinfo is None:
+            raise ValueError("funding timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("rate")
+    @classmethod
+    def validate_rate(cls, value: Decimal) -> Decimal:
+        """Reject non-finite rates while preserving decimal precision."""
+        if not value.is_finite():
+            raise ValueError("funding rate must be finite")
+        return value
+
+    @classmethod
+    def from_rest(cls, payload: dict[str, Any]) -> FundingObservation:
+        """Parse a fundingHistory row without losing decimal or timestamp precision."""
+        coin, timestamp, rate = payload.get("coin"), payload.get("time"), payload.get("fundingRate")
+        if not isinstance(coin, str) or not isinstance(timestamp, int) or isinstance(timestamp, bool):
+            raise TypeError("Invalid funding observation identity")
+        if rate is None:
+            raise ValueError("Missing funding rate")
+        return cls(
+            coin=coin,
+            ts=datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=timestamp),
+            rate=Decimal(str(rate)),
         )
 
 

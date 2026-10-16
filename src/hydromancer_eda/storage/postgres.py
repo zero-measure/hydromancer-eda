@@ -91,11 +91,12 @@ class PostgresStore:
         query = """
         INSERT INTO orderflow_events (
             ts, symbol, wallet, side, aggressor, price, size, notional,
-            order_id, trade_id, tx_index, realized_pnl, liquidation,
+            order_id, trade_id, tx_index, realized_pnl, direction, start_position,
+            direction_provenance, start_position_provenance, liquidation,
             liquidation_mark_price, liquidation_method
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
-            $9, $10, $11, $12, $13, $14, $15
+            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT DO NOTHING
         """
@@ -114,6 +115,10 @@ class PostgresStore:
                 e.trade_id,
                 e.tx_index,
                 e.realized_pnl,
+                e.direction,
+                e.start_position,
+                e.direction_provenance,
+                e.start_position_provenance,
                 e.liquidation,
                 e.liquidation_mark_price,
                 e.liquidation_method,
@@ -147,6 +152,36 @@ class PostgresStore:
                 "SELECT session_id, cursor FROM ingestion_checkpoints WHERE channel = $1", channel
             )
         return (None, None) if row is None else (row["session_id"], row["cursor"])
+
+    async def latest_orderflow_timestamp(self) -> datetime | None:
+        """Return the newest durably stored participant-fill timestamp."""
+        if not self._pool:
+            raise RuntimeError("Pool not initialized")
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval("SELECT MAX(ts) FROM orderflow_events")
+        return value if isinstance(value, datetime) else None
+
+    async def record_ingestion_gap(
+        self,
+        channel: str,
+        start_ts: datetime,
+        end_ts: datetime,
+        reason: str,
+    ) -> None:
+        """Persist a known source-coverage gap without storing cursor contents."""
+        if not self._pool:
+            raise RuntimeError("Pool not initialized")
+        if end_ts < start_ts:
+            start_ts, end_ts = end_ts, start_ts
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO ingestion_gaps (channel,start_ts,end_ts,reason)
+                   VALUES ($1,$2,$3,$4)""",
+                channel,
+                start_ts,
+                end_ts,
+                reason,
+            )
 
     async def persist_allfills_frame(
         self,
@@ -183,10 +218,11 @@ class PostgresStore:
         insert = """
         INSERT INTO orderflow_events (
             ts, symbol, wallet, side, aggressor, price, size, notional,
-            order_id, trade_id, tx_index, realized_pnl, liquidation,
+            order_id, trade_id, tx_index, realized_pnl, direction, start_position,
+            direction_provenance, start_position_provenance, liquidation,
             liquidation_mark_price, liquidation_method
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         ON CONFLICT DO NOTHING
         """
         rows = [
@@ -194,7 +230,8 @@ class PostgresStore:
                 event.ts, event.symbol, event.wallet, event.side, event.aggressor,
                 event.price, event.size, event.notional, event.order_id,
                 event.trade_id, event.tx_index, event.realized_pnl,
-                event.liquidation, event.liquidation_mark_price,
+                event.direction, event.start_position, event.direction_provenance,
+                event.start_position_provenance, event.liquidation, event.liquidation_mark_price,
                 event.liquidation_method,
             )
             for event in events

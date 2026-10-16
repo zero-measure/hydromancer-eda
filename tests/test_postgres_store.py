@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from hydromancer_eda.config import Settings
-from hydromancer_eda.models import WalletLabelSnapshot
+from hydromancer_eda.models import OrderflowEvent, WalletLabelSnapshot
 from hydromancer_eda.storage.postgres import PostgresStore
 
 
@@ -28,6 +28,9 @@ class Connection:
     async def executemany(self, query: str, rows: list[tuple[object, ...]]) -> None:
         self.query = query
         self.rows = rows
+
+    async def execute(self, query: str, *args: object) -> str:
+        return "OK"
 
 
 class AcquireConnection:
@@ -72,6 +75,12 @@ def test_schema_contains_only_explicit_reset_for_destructive_changes() -> None:
     assert "wallet_leverage_state" in schema
     assert "wallet_markout_samples" in schema
     assert "markout_metrics JSONB" in schema
+    assert "start_position_provenance" in schema
+    assert "direction_backfill_runs" in schema
+    assert "local_candidate_count" in schema
+    assert "source_complete" in schema
+    assert "rejected_count" in schema
+    assert "ingestion_gaps" in schema
     assert "DROP TABLE" not in schema
     assert "TRUNCATE" not in schema
 
@@ -94,11 +103,42 @@ def test_explicit_reset_removes_all_analytics_but_not_operational_state() -> Non
         "wallet_leverage_state",
         "wallet_markout_samples",
         "wallet_flow_labels",
+        "direction_backfill_runs",
     ):
         assert f"DROP TABLE IF EXISTS public.{table} CASCADE" in executable
     assert "ingestion_checkpoints" not in executable
     assert "ingestion_rejects" not in executable
+    assert "ingestion_gaps" not in executable
     assert "TRUNCATE" not in executable
+
+
+def test_orderflow_insert_binds_direction_fields_in_schema_order() -> None:
+    store, connection = store_with_connection()
+    event = OrderflowEvent(
+        ts=datetime(2025, 1, 1, tzinfo=UTC), symbol="BTC", wallet="0xabc",
+        side="buy", aggressor="taker", price=2, size=3, notional=6, tx_index=4,
+        direction="Open Long", start_position=0, direction_provenance="allFills",
+        start_position_provenance="allFills",
+    )
+
+    assert asyncio.run(store.insert_events([event])) == 1
+    assert "$19" in connection.query
+    assert connection.rows[0][12:16] == ("Open Long", 0, "allFills", "allFills")
+    assert len(connection.rows[0]) == 19
+
+
+def test_atomic_allfills_insert_binds_all_direction_fields() -> None:
+    store, connection = store_with_connection()
+    event = OrderflowEvent(
+        ts=datetime(2025, 1, 1, tzinfo=UTC), symbol="BTC", wallet="0xabc",
+        side="buy", aggressor="taker", price=2, size=3, notional=6, tx_index=4,
+        direction="Open Long", start_position=0, direction_provenance="allFills",
+        start_position_provenance="allFills",
+    )
+
+    assert asyncio.run(store.persist_allfills_frame([event], "session", "opaque")) == 1
+    assert "$19" in connection.query
+    assert len(connection.rows[0]) == 19
 
 
 def test_label_upsert_persists_compact_classifier_features() -> None:
