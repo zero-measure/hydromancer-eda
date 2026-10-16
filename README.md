@@ -285,6 +285,13 @@ DB_USER=postgres \
 ./query_db.sh
 ```
 
+## Publication safety
+
+See [SECURITY.md](SECURITY.md) before making a fork or repository public. Local
+credentials, wallet signing material, raw datasets, generated notebooks/reports,
+and agent configuration are excluded from Git by default. The GitHub secret-scan
+workflow checks committed history; it does not replace a local pre-push review.
+
 ## Verification
 
 ```bash

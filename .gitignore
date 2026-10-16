@@ -1,21 +1,148 @@
-# Secrets
+# Credentials: only reviewed, placeholder-only templates may be published.
 .env
 .env.*
+*.env
+*.env.*
 !.env.example
 !.env.sample
 !.env.template
+!*.env.example
+!*.env.sample
+!*.env.template
+.envrc*
+secrets/
+.secrets/
+secrets.json
+secrets.toml
+secrets.yaml
+secrets.yml
+credentials/
+credentials
+credentials.*
+.aws/
+.ssh/
+.gnupg/
+.netrc
+.npmrc
+.pypirc
+.boto
+.s3cfg
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
 
-# macOS
-.DS_Store
+# Wallet signing material / seed backups (public addresses in source are OK).
+wallets/
+.wallets/
+keystore/
+keystores/
+wallet*.json
+wallet*.txt
+UTC--*
+*keypair*.json
+*private*key*.json
+*secret*key*.json
+id.json
+id_*.json
+*mnemonic*.txt
+*mnemonic*.json
+mnemonic
+keypair
+*seed*phrase*
+seed.txt
+seed.json
+*.wallet
+*.seed
 
-# Python and Jupyter
+# Local tooling, agent histories/configuration, and installed third-party skills.
+.agents/
+.claude/
+.pi/
+.codex/
+.cursor/
+.aider*
+.vscode/
+.idea/
+/skills-lock.json
+
+# Raw data, wallet-level exports, generated reports, and database backups.
+data/
+datasets/
+output/
+outputs/
+reports/
+artifacts/
+backups/
+pgdata/
+postgres-data/
+*.csv
+*.tsv
+*.parquet
+*.arrow
+*.feather
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.jsonl
+*.ndjson
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+dump*.sql
+backup*.sql
+
+# Logs/checkpoints can contain API tokens, session IDs, cursors, and payloads.
+logs/
+runtime/
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.cursor
+*.checkpoint
+.gitleaks-report*
+gitleaks-report*
+
+# Infrastructure state and local deployment overrides may contain credentials.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+compose.override.yml
+compose.override.yaml
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Python and Jupyter: notebook outputs/HTML may embed tokens or private data.
 __pycache__/
 .ipynb_checkpoints/
-/Untitled.ipynb
+.virtual_documents/
+.ipython/
+.jupyter/
+*.ipynb
+*.html
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 *.egg-info/
 dist/
 build/
@@ -23,3 +150,13 @@ build/
 # Virtual environments
 .venv/
 venv/
+env/
+
+# macOS and editor/backup files
+.DS_Store
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
